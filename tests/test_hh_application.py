@@ -18,6 +18,7 @@ from app.services.hh_application import (
     HHResumeSelectionRequired,
 )
 from app.sources.hh import HHAuthorizationError
+from app.sources.hh import HHAPIError, HHRemoteError, HHResumeNotFoundError
 
 
 @pytest_asyncio.fixture
@@ -42,6 +43,7 @@ class FakeHHClient:
     def __init__(self, resumes: list[HHResumeData]) -> None:
         self.resumes = resumes
         self.resume_checks = 0
+        self.resume_error: Exception | None = None
         self.vacancy_details: dict = {
             "apply_alternate_url": "https://hh.ru/vacancy/1"
         }
@@ -51,6 +53,8 @@ class FakeHHClient:
 
     async def get_owned_resume(self, token: str, resume_id: str) -> dict:
         self.resume_checks += 1
+        if self.resume_error is not None:
+            raise self.resume_error
         return {"id": resume_id}
 
     async def get_vacancy(self, vacancy_id: str) -> dict:
@@ -280,3 +284,34 @@ async def test_required_test_uses_manual_action_message(database: Database) -> N
     assert result.status == "manual_action_required"
     assert "пройти тест" in result.message
     assert row is not None and row.error_code == "test_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (HHResumeNotFoundError("missing"), "resume_not_found"),
+        (HHRemoteError(429, "rate_limit"), "rate_limit"),
+        (HHRemoteError(503, "service_unavailable"), "temporary_hh_error"),
+        (HHAPIError("timeout"), "hh_request_failed"),
+    ],
+)
+async def test_final_preflight_failures_use_safe_manual_result(
+    database: Database, error: Exception, expected_code: str
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    service.hh_client.resume_error = error  # type: ignore[attr-defined]
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    row = await repository.get_owned(preview.draft_id, 42)
+
+    assert result.status == "manual_action_required"
+    assert result.manual_url == "https://hh.ru/vacancy/1"
+    assert row is not None and row.error_code == expected_code
+    assert row.api_status == "manual_action_required"

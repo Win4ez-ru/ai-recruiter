@@ -302,6 +302,50 @@ class HHApplicationService:
                 message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
                 manual_url=vacancy.url,
             )
+        except HHAuthorizationError:
+            await self.application_repository.mark_manual_action(
+                application.id,
+                code="authorization_expired",
+                message="Авторизация HeadHunter истекла.",
+            )
+            return ApplicationResult(
+                status="manual_action_required",
+                message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
+                manual_url=vacancy.url,
+            )
+        except HHRemoteError as exc:
+            is_rate_limit = exc.status_code == 429
+            message = (
+                "HeadHunter временно ограничил число запросов. Проверь отклики "
+                "на сайте и попробуй позже."
+                if is_rate_limit
+                else "HeadHunter временно недоступен. Проверь отклики на сайте."
+            )
+            await self.application_repository.mark_manual_action(
+                application.id,
+                code="rate_limit" if is_rate_limit else "temporary_hh_error",
+                message=message,
+            )
+            return ApplicationResult(
+                status="manual_action_required",
+                message=message,
+                manual_url=vacancy.url,
+            )
+        except HHAPIError:
+            message = (
+                "Не удалось подтвердить результат проверки в HeadHunter. "
+                "Проверь отклики на сайте."
+            )
+            await self.application_repository.mark_manual_action(
+                application.id,
+                code="hh_request_failed",
+                message=message,
+            )
+            return ApplicationResult(
+                status="manual_action_required",
+                message=message,
+                manual_url=vacancy.url,
+            )
 
         try:
             details = await self.hh_client.get_vacancy(vacancy.external_id)
