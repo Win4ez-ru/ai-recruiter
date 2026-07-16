@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -8,7 +9,9 @@ from typing import Any
 from app.config import Settings
 from app.models import UserIntegration, utc_now
 from app.repositories.hh_integration_repository import HHIntegrationRepository
-from app.sources.hh import HHAuthorizationError, HHClient
+from app.sources.hh import HHAPIError, HHAuthorizationError, HHClient
+
+logger = logging.getLogger(__name__)
 
 
 def _aware(value: datetime) -> datetime:
@@ -55,11 +58,17 @@ class HHOAuthService:
         )
         access_token = str(payload["access_token"])
         me = await self.client.get_current_user(access_token)
-        return await self._save_token_payload(
+        integration = await self._save_token_payload(
             telegram_user_id=telegram_user_id,
             payload=payload,
             external_user_id=str(me.get("id")) if me.get("id") is not None else None,
         )
+        try:
+            resumes = await self.client.get_my_resumes(access_token)
+            await self.repository.save_resumes(telegram_user_id, resumes)
+        except HHAPIError:
+            logger.warning("HH OAuth completed, but initial resume sync failed")
+        return integration
 
     async def _save_token_payload(
         self,

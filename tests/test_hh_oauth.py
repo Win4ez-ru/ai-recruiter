@@ -12,6 +12,7 @@ from app.database import Database
 from app.models import OAuthState, utc_now
 from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.services.hh_oauth import HHOAuthService
+from app.schemas import HHResumeData
 from app.sources.hh import HHAuthorizationError
 
 
@@ -58,6 +59,10 @@ class FakeOAuthClient:
         assert access_token == "access-token"
         return {"id": "hh-user-7"}
 
+    async def get_my_resumes(self, access_token: str) -> list[HHResumeData]:
+        assert access_token == "access-token"
+        return [HHResumeData(external_id="resume-1", title="iOS Developer")]
+
     async def refresh_access_token(self, refresh_token: str) -> dict:
         self.refresh_calls += 1
         assert refresh_token == "old-refresh"
@@ -87,6 +92,8 @@ async def test_oauth_state_is_hashed_bound_and_one_time(database: Database) -> N
     )
     assert integration.external_user_id == "hh-user-7"
     assert integration.access_token == "access-token"
+    resumes = await repository.list_resumes(42)
+    assert [item.external_id for item in resumes] == ["resume-1"]
 
     with pytest.raises(HHAuthorizationError):
         await service.complete_authorization(
