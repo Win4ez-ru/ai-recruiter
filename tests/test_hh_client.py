@@ -3,7 +3,13 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.sources.hh import HHClient, html_to_text, vacancy_from_hh
+from app.sources.hh import (
+    HHAuthorizationError,
+    HHClient,
+    HHTokenExpiredError,
+    html_to_text,
+    vacancy_from_hh,
+)
 
 
 @pytest.mark.asyncio
@@ -67,3 +73,138 @@ def test_hh_html_and_mapping_handle_missing_optional_fields() -> None:
     )
     assert mapped.company == "Не указана"
     assert mapped.salary_from is None
+
+
+@pytest.mark.asyncio
+async def test_hh_client_gets_current_users_resumes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/me":
+            return httpx.Response(
+                200,
+                json={"id": "7", "resumes_url": "https://api.hh.ru/resumes/mine"},
+            )
+        if request.url.path == "/resumes/mine":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": "resume-1",
+                            "title": "iOS Developer",
+                            "status": {"id": "published"},
+                            "alternate_url": "https://hh.ru/resume/resume-1",
+                            "updated_at": "2026-07-15T12:00:00+0300",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient("TestAgent/1.0", http_client=http_client, retries=0)
+        resumes = await client.get_my_resumes("secret-token")
+
+    assert [item.external_id for item in resumes] == ["resume-1"]
+    assert resumes[0].status == "published"
+    assert all(request.headers["Authorization"] == "Bearer secret-token" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_hh_client_exchanges_oauth_code_with_pkce() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 3600,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            client_id="client",
+            client_secret="secret",
+            redirect_uri="https://example.test/oauth/hh/callback",
+        )
+        payload = await client.exchange_code(
+            authorization_code="code", code_verifier="verifier"
+        )
+
+    assert payload["access_token"] == "access"
+    body = captured[0].content.decode()
+    assert "grant_type=authorization_code" in body
+    assert "code_verifier=verifier" in body
+
+
+@pytest.mark.asyncio
+async def test_hh_client_refresh_uses_current_official_parameter_set() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            client_id="must-not-be-sent",
+            client_secret="must-not-be-sent",
+        )
+        await client.refresh_access_token("refresh")
+
+    body = captured[0].content.decode()
+    assert "grant_type=refresh_token" in body
+    assert "refresh_token=refresh" in body
+    assert "client_id" not in body
+    assert "client_secret" not in body
+
+
+@pytest.mark.asyncio
+async def test_hh_client_normalizes_expired_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"errors": [{"type": "oauth", "value": "token_expired"}]}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient("TestAgent/1.0", http_client=http_client)
+        with pytest.raises(HHTokenExpiredError):
+            await client.get_current_user("expired")
+
+
+@pytest.mark.asyncio
+async def test_hh_client_rejects_non_applicant_account() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "manager"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient("TestAgent/1.0", http_client=http_client)
+        with pytest.raises(HHAuthorizationError):
+            await client.get_my_resumes("token")

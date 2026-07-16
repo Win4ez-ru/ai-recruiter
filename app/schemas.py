@@ -116,3 +116,40 @@ class StatsResult(BaseModel):
     rejected: int
     average_score: float
     common_missing_skills: list[tuple[str, int]]
+
+
+HHApplicationStatus = Literal[
+    "draft",
+    "awaiting_confirmation",
+    "submitting",
+    "submitted",
+    "failed",
+    "manual_action_required",
+]
+
+
+class HHResumeData(BaseModel):
+    external_id: str
+    title: str
+    status: str | None = None
+    url: str | None = None
+    updated_at: datetime | None = None
+    is_default: bool = False
+
+
+class PreparedApplication(BaseModel):
+    draft_id: int
+    vacancy_id: int
+    vacancy_title: str
+    company: str
+    vacancy_url: str
+    resume: HHResumeData
+    resumes: list[HHResumeData]
+    cover_letter: str
+
+
+class ApplicationResult(BaseModel):
+    status: HHApplicationStatus
+    message: str
+    external_id: str | None = None
+    manual_url: str | None = None

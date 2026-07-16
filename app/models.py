@@ -100,4 +100,111 @@ class Application(Base):
     vacancy: Mapped[Vacancy] = relationship(back_populates="application")
 
 
+class UserIntegration(Base):
+    __tablename__ = "user_integrations"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "provider", name="uq_user_integration_provider"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True)
+    provider: Mapped[str] = mapped_column(String(32), default="hh")
+    access_token: Mapped[str] = mapped_column(Text)
+    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class OAuthState(Base):
+    __tablename__ = "oauth_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True)
+    provider: Mapped[str] = mapped_column(String(32), default="hh")
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    code_verifier: Mapped[str] = mapped_column(String(160))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class HHResume(Base):
+    __tablename__ = "hh_resumes"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "external_id", name="uq_hh_resume_user_external"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True)
+    external_id: Mapped[str] = mapped_column(String(128))
+    title: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    external_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class HHApplication(Base):
+    __tablename__ = "hh_applications"
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id",
+            "source",
+            "vacancy_external_id",
+            "resume_external_id",
+            name="uq_hh_application_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True)
+    vacancy_id: Mapped[int] = mapped_column(
+        ForeignKey("vacancies.id", ondelete="CASCADE"), index=True
+    )
+    source: Mapped[str] = mapped_column(String(32), default="hh")
+    vacancy_external_id: Mapped[str] = mapped_column(String(128))
+    resume_external_id: Mapped[str] = mapped_column(String(128))
+    cover_letter: Mapped[str] = mapped_column(Text)
+    process_status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    api_status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    external_application_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitting_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class ApplicationConfirmation(Base):
+    __tablename__ = "application_confirmations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True)
+    vacancy_id: Mapped[int] = mapped_column(ForeignKey("vacancies.id", ondelete="CASCADE"))
+    resume_external_id: Mapped[str] = mapped_column(String(128))
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("hh_applications.id", ondelete="CASCADE"), index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 JsonDict = dict[str, Any]
