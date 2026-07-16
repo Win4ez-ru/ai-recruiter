@@ -183,6 +183,17 @@ class HHIntegrationRepository:
                 ).all()
             )
 
+    async def get_owned_resume(
+        self, *, telegram_user_id: int, resume_id: int
+    ) -> HHResume | None:
+        async with self.database.session_factory() as session:
+            return await session.scalar(
+                select(HHResume).where(
+                    HHResume.id == resume_id,
+                    HHResume.telegram_user_id == telegram_user_id,
+                )
+            )
+
     async def set_default_resume(
         self, *, telegram_user_id: int, external_id: str
     ) -> HHResume | None:

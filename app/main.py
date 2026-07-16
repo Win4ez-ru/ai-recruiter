@@ -14,10 +14,13 @@ from pydantic import ValidationError
 from app.bot.callbacks import build_callbacks_router
 from app.bot.context import BotContext
 from app.bot.handlers import build_handlers_router
+from app.bot.hh_applications import build_hh_applications_router
 from app.config import Settings, get_settings
 from app.database import Database
 from app.logging_config import configure_logging
 from app.repositories.application_repository import ApplicationRepository
+from app.repositories.hh_application_repository import HHApplicationRepository
+from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
 from app.scheduler.jobs import create_scheduler
 from app.services.candidate_profile import (
@@ -27,6 +30,9 @@ from app.services.candidate_profile import (
 )
 from app.services.cover_letter import CoverLetterService
 from app.services.digest import DigestService
+from app.services.hh_application import HHApplicationService
+from app.services.hh_oauth import HHOAuthService
+from app.services.hh_oauth_callback import HHOAuthCallbackServer
 from app.services.vacancy_filter import VacancyFilter
 from app.services.vacancy_ranker import VacancyRanker
 from app.services.vacancy_search import VacancySearchService
@@ -43,6 +49,7 @@ BOT_COMMANDS = [
     BotCommand(command="applied", description="Мои отклики"),
     BotCommand(command="stats", description="Статистика"),
     BotCommand(command="profile", description="Профиль"),
+    BotCommand(command="hh", description="Подключить HeadHunter"),
     BotCommand(command="help", description="Справка"),
 ]
 
@@ -57,12 +64,22 @@ async def async_main(settings: Settings) -> None:
     )
     openai_client = AsyncOpenAI(api_key=settings.openai_api_key, max_retries=2)
     scheduler = None
-    hh_client = HHClient(settings.hh_user_agent)
+    callback_server = None
+    hh_client = HHClient(
+        settings.hh_user_agent,
+        api_base_url=settings.hh_api_base_url,
+        auth_base_url=settings.hh_auth_base_url,
+        client_id=settings.hh_client_id,
+        client_secret=settings.hh_client_secret,
+        redirect_uri=settings.hh_redirect_uri,
+    )
 
     try:
         await database.create_tables()
         vacancy_repository = VacancyRepository(database)
         application_repository = ApplicationRepository(database)
+        hh_integration_repository = HHIntegrationRepository(database)
+        hh_application_repository = HHApplicationRepository(database)
         ranker = VacancyRanker(
             openai_client, settings.openai_model, profile, resume
         )
@@ -76,6 +93,18 @@ async def async_main(settings: Settings) -> None:
             ranker,
             min_score=settings.min_score_to_send,
         )
+        hh_oauth_service = HHOAuthService(
+            hh_client, hh_integration_repository, settings
+        )
+        hh_application_service = HHApplicationService(
+            hh_client=hh_client,
+            oauth_service=hh_oauth_service,
+            integration_repository=hh_integration_repository,
+            application_repository=hh_application_repository,
+            vacancy_repository=vacancy_repository,
+            cover_letter_service=cover_letter_service,
+            confirmation_ttl_seconds=settings.hh_confirmation_ttl_seconds,
+        )
         context = BotContext(
             settings=settings,
             profile=profile,
@@ -84,15 +113,24 @@ async def async_main(settings: Settings) -> None:
             search_service=search_service,
             digest_service=DigestService(vacancy_repository),
             cover_letter_service=cover_letter_service,
+            hh_integration_repository=hh_integration_repository,
+            hh_application_repository=hh_application_repository,
+            hh_oauth_service=hh_oauth_service,
+            hh_application_service=hh_application_service,
             search_lock=asyncio.Lock(),
         )
         dispatcher = Dispatcher()
+        dispatcher.include_router(build_hh_applications_router(context))
         dispatcher.include_router(build_callbacks_router(context))
         dispatcher.include_router(build_handlers_router(context))
         scheduler = create_scheduler(bot, context)
+        callback_server = HHOAuthCallbackServer(
+            settings=settings, oauth_service=hh_oauth_service, bot=bot
+        )
 
         await bot.set_my_commands(BOT_COMMANDS)
         await bot.delete_webhook(drop_pending_updates=False)
+        await callback_server.start()
         scheduler.start()
         logger.info("Job Agent started")
         await dispatcher.start_polling(
@@ -101,6 +139,8 @@ async def async_main(settings: Settings) -> None:
     finally:
         if scheduler and scheduler.running:
             scheduler.shutdown(wait=False)
+        if callback_server is not None:
+            await callback_server.close()
         await hh_client.close()
         await openai_client.close()
         await bot.session.close()

@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.bot.context import BotContext
+from app.bot.keyboards import connect_hh_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ HELP_TEXT = """<b>Персональный бот поиска iOS-ваканс�
 /applied — вакансии, на которые вы откликнулись
 /stats — статистика поиска и откликов
 /profile — краткий профиль кандидата
+/hh — подключение аккаунта HeadHunter
 /help — эта справка"""
 
 
@@ -172,6 +174,33 @@ def build_handlers_router(context: BotContext) -> Router:
             f"Минимальная зарплата: {profile.minimum_salary_rub:,} ₽\n\n"
             f"Изменить профиль: <code>data/candidate_profile.json</code>\n"
             f"Изменить резюме: <code>data/resume.txt</code>"
+        )
+
+    @router.message(Command("hh"))
+    async def hh_handler(message: Message) -> None:
+        if not await authorized(message):
+            return
+        integration = await context.hh_integration_repository.get_integration(
+            context.settings.telegram_user_id
+        )
+        if integration is not None:
+            resumes = await context.hh_integration_repository.list_resumes(
+                context.settings.telegram_user_id
+            )
+            await message.answer(
+                "HeadHunter подключен. "
+                f"Синхронизировано резюме: {len(resumes)}."
+            )
+            return
+        if not context.settings.hh_oauth_configured:
+            await message.answer(
+                "OAuth HeadHunter не настроен. Заполни HH_CLIENT_ID, "
+                "HH_CLIENT_SECRET и HH_REDIRECT_URI в .env."
+            )
+            return
+        await message.answer(
+            "Подключи аккаунт через официальный OAuth HeadHunter.",
+            reply_markup=connect_hh_keyboard(),
         )
 
     @router.message()

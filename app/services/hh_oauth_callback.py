@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from aiohttp import web
 
 from app.config import Settings
@@ -86,10 +87,13 @@ class HHOAuthCallbackServer:
                 charset="utf-8",
                 status=503,
             )
-        await self.bot.send_message(
-            self.settings.telegram_user_id,
-            "HeadHunter успешно подключен. Теперь можно подготовить отклик.",
-        )
+        try:
+            await self.bot.send_message(
+                self.settings.telegram_user_id,
+                "HeadHunter успешно подключен. Теперь можно подготовить отклик.",
+            )
+        except TelegramAPIError:
+            logger.warning("HH OAuth succeeded, but Telegram notification failed")
         return web.Response(
             text="HeadHunter успешно подключен. Можно вернуться в Telegram.",
             content_type="text/plain",

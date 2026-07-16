@@ -129,6 +129,7 @@ HHApplicationStatus = Literal[
 
 
 class HHResumeData(BaseModel):
+    local_id: int | None = None
     external_id: str
     title: str
     status: str | None = None

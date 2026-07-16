@@ -45,6 +45,8 @@ class HHResumeSelectionRequired(HHApplicationError):
 class HHConfirmationError(HHApplicationError):
     """An application confirmation is invalid or unavailable."""
 
+    user_message = "Черновик недоступен, устарел или уже был обработан."
+
 
 class HHRateLimitError(HHApplicationError):
     user_message = "HeadHunter временно ограничил число запросов. Попробуй позже."
@@ -62,6 +64,7 @@ class ConfirmationPreview:
 
 def _resume_data(row: HHResume) -> HHResumeData:
     return HHResumeData(
+        local_id=row.id,
         external_id=row.external_id,
         title=row.title,
         status=row.status,

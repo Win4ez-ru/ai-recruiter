@@ -114,6 +114,7 @@ async def test_prepare_application_creates_draft(database: Database) -> None:
     preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
 
     assert preview.resume.external_id == "resume-1"
+    assert preview.resume.local_id is not None
     assert preview.cover_letter
     row = await repository.get_owned(preview.draft_id, 42)
     assert row is not None and row.api_status == "draft"
