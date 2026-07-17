@@ -7,7 +7,8 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+TELEGRAM_PROXY_SCHEMES = {"http", "socks4", "socks5"}
+HTTPX_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 def _parse_proxy_list(value: Any) -> list[SecretStr]:
@@ -28,15 +29,17 @@ def _parse_proxy_list(value: Any) -> list[SecretStr]:
     raise TypeError("proxy list must be a comma-separated string")
 
 
-def _validate_proxy_url(value: SecretStr | None) -> SecretStr | None:
+def _validate_proxy_url(
+    value: SecretStr | None, *, allowed_schemes: set[str]
+) -> SecretStr | None:
     if value is None:
         return None
     raw_value = value.get_secret_value().strip()
     if not raw_value:
         return None
     parsed = urlparse(raw_value)
-    if parsed.scheme.lower() not in PROXY_SCHEMES or not parsed.hostname:
-        allowed = ", ".join(sorted(PROXY_SCHEMES))
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.hostname:
+        allowed = ", ".join(sorted(allowed_schemes))
         raise ValueError(f"proxy URL must use one of: {allowed}")
     return SecretStr(raw_value)
 
@@ -117,12 +120,20 @@ class Settings(BaseSettings):
     def validate_telegram_proxy_urls(
         cls, values: list[SecretStr]
     ) -> list[SecretStr]:
-        return [value for item in values if (value := _validate_proxy_url(item))]
+        return [
+            value
+            for item in values
+            if (
+                value := _validate_proxy_url(
+                    item, allowed_schemes=TELEGRAM_PROXY_SCHEMES
+                )
+            )
+        ]
 
     @field_validator("hh_proxy_url", "openai_proxy_url")
     @classmethod
     def validate_optional_proxy(cls, value: SecretStr | None) -> SecretStr | None:
-        return _validate_proxy_url(value)
+        return _validate_proxy_url(value, allowed_schemes=HTTPX_PROXY_SCHEMES)
 
     @model_validator(mode="after")
     def validate_network_configuration(self) -> "Settings":
@@ -132,10 +143,10 @@ class Settings(BaseSettings):
             )
         if (
             self.telegram_polling_backoff_max_seconds
-            < self.telegram_polling_backoff_min_seconds
+            <= self.telegram_polling_backoff_min_seconds
         ):
             raise ValueError(
-                "Telegram polling backoff max must be greater than or equal to min"
+                "Telegram polling backoff max must be greater than min"
             )
         if self.hh_retry_max_delay_seconds < self.hh_retry_base_delay_seconds:
             raise ValueError("HH retry max delay must be greater than or equal to base")

@@ -18,6 +18,11 @@ from app.bot.hh_applications import build_hh_applications_router
 from app.config import Settings, get_settings
 from app.database import Database
 from app.logging_config import configure_logging
+from app.network.telegram import (
+    build_telegram_session,
+    telegram_backoff_config,
+    wait_for_telegram,
+)
 from app.repositories.application_repository import ApplicationRepository
 from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
@@ -61,6 +66,7 @@ async def async_main(settings: Settings) -> None:
     bot = Bot(
         token=settings.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=build_telegram_session(settings),
     )
     openai_client = AsyncOpenAI(api_key=settings.openai_api_key, max_retries=2)
     scheduler = None
@@ -128,13 +134,20 @@ async def async_main(settings: Settings) -> None:
             settings=settings, oauth_service=hh_oauth_service, bot=bot
         )
 
-        await bot.set_my_commands(BOT_COMMANDS)
-        await bot.delete_webhook(drop_pending_updates=False)
         await callback_server.start()
+        await wait_for_telegram(
+            bot,
+            BOT_COMMANDS,
+            backoff_config=telegram_backoff_config(settings),
+        )
         scheduler.start()
         logger.info("Job Agent started")
         await dispatcher.start_polling(
-            bot, allowed_updates=dispatcher.resolve_used_update_types()
+            bot,
+            allowed_updates=dispatcher.resolve_used_update_types(),
+            polling_timeout=settings.telegram_polling_timeout_seconds,
+            backoff_config=telegram_backoff_config(settings),
+            close_bot_session=False,
         )
     finally:
         if scheduler and scheduler.running:

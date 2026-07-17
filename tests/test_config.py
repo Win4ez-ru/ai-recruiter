@@ -46,3 +46,10 @@ def test_telegram_requires_at_least_one_route() -> None:
 def test_proxy_settings_reject_unsupported_schemes(field: str) -> None:
     with pytest.raises(ValidationError, match="proxy URL"):
         make_settings(**{field: "ftp://proxy.example:21"})
+
+
+def test_proxy_settings_respect_provider_transport_schemes() -> None:
+    with pytest.raises(ValidationError, match="http, socks4, socks5"):
+        make_settings(telegram_proxy_urls="socks5h://proxy.example:1080")
+    with pytest.raises(ValidationError, match="http, https, socks5, socks5h"):
+        make_settings(hh_proxy_url="socks4://proxy.example:1080")
