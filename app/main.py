@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import sys
 from collections.abc import Awaitable, Callable
 
@@ -66,6 +67,32 @@ BOT_COMMANDS = [
 
 
 async def async_main(settings: Settings) -> None:
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    registered_signals: list[signal.Signals] = []
+
+    def request_shutdown(signal_name: str) -> None:
+        logger.info(
+            "Shutdown signal received",
+            extra={"event": "shutdown_requested", "signal": signal_name},
+        )
+        if main_task is not None and not main_task.cancelling():
+            main_task.cancel()
+
+    for signal_name in ("SIGINT", "SIGTERM"):
+        shutdown_signal = getattr(signal, signal_name, None)
+        if shutdown_signal is None:
+            continue
+        try:
+            loop.add_signal_handler(
+                shutdown_signal,
+                request_shutdown,
+                signal_name,
+            )
+        except (NotImplementedError, RuntimeError):
+            continue
+        registered_signals.append(shutdown_signal)
+
     health = HealthRegistry()
     health.set_component("database", "starting")
     health.set_component("telegram", "starting")
@@ -210,7 +237,10 @@ async def async_main(settings: Settings) -> None:
             polling_timeout=settings.telegram_polling_timeout_seconds,
             backoff_config=telegram_backoff_config(settings),
             close_bot_session=False,
+            handle_signals=False,
         )
+    except asyncio.CancelledError:
+        logger.info("Job Agent shutdown requested")
     finally:
         health.mark_stopping()
         if scheduler and scheduler.running:
@@ -230,6 +260,8 @@ async def async_main(settings: Settings) -> None:
             await _close_resource("telegram_session", telegram_session.close)
         if database is not None:
             await _close_resource("database", database.close)
+        for shutdown_signal in registered_signals:
+            loop.remove_signal_handler(shutdown_signal)
         logger.info("Job Agent stopped")
 
 
