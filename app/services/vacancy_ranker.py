@@ -4,8 +4,11 @@ import json
 import logging
 from typing import Any
 
+from openai import OpenAIError
+
 from app.models import Vacancy
 from app.schemas import CandidateProfile, VacancyAnalysisResult, VacancyFilterResult
+from app.services.openai_errors import normalize_openai_error
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,21 @@ class VacancyRanker:
                 logger.warning("OpenAI returned no parsed analysis for vacancy %s", vacancy.id)
                 return None
             return VacancyAnalysisResult.model_validate(parsed)
+        except OpenAIError as exc:
+            error = normalize_openai_error(exc)
+            logger.warning(
+                "OpenAI analysis request failed",
+                extra={
+                    "event": "openai_rank_failed",
+                    "vacancy_id": vacancy.id,
+                    "error_code": error.code,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise error from exc
         except Exception:
-            logger.exception("OpenAI analysis failed for vacancy %s", vacancy.id)
+            logger.exception(
+                "Unexpected OpenAI analysis processing error for vacancy %s",
+                vacancy.id,
+            )
             return None

@@ -5,8 +5,11 @@ import logging
 import re
 from typing import Any
 
+from openai import OpenAIError
+
 from app.models import Vacancy
 from app.schemas import CandidateProfile
+from app.services.openai_errors import normalize_openai_error
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,21 @@ class CoverLetterService:
                 logger.warning("OpenAI returned an empty cover letter for %s", vacancy.id)
                 return None
             return text
+        except OpenAIError as exc:
+            error = normalize_openai_error(exc)
+            logger.warning(
+                "OpenAI cover-letter request failed",
+                extra={
+                    "event": "openai_cover_letter_failed",
+                    "vacancy_id": vacancy.id,
+                    "error_code": error.code,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise error from exc
         except Exception:
-            logger.exception("Cover letter generation failed for vacancy %s", vacancy.id)
+            logger.exception(
+                "Unexpected cover-letter processing error for vacancy %s",
+                vacancy.id,
+            )
             return None

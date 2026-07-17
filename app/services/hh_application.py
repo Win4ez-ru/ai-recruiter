@@ -8,6 +8,7 @@ from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import ApplicationResult, HHResumeData, PreparedApplication
 from app.services.cover_letter import CoverLetterService
+from app.services.openai_errors import OpenAIServiceError
 from app.services.hh_oauth import HHOAuthService
 from app.sources.hh import (
     HHAPIError,
@@ -54,6 +55,10 @@ class HHRateLimitError(HHApplicationError):
 
 class HHTemporaryApplicationError(HHApplicationError):
     user_message = "HeadHunter временно недоступен. Попробуй позже."
+
+
+class HHCoverLetterUnavailableError(HHApplicationError):
+    user_message = "Не удалось создать письмо: OpenAI временно недоступен."
 
 
 @dataclass(slots=True)
@@ -165,7 +170,10 @@ class HHApplicationService:
         )
         cover_letter = existing.cover_letter if existing else None
         if not cover_letter:
-            cover_letter = await self.cover_letter_service.generate(vacancy)
+            try:
+                cover_letter = await self.cover_letter_service.generate(vacancy)
+            except OpenAIServiceError as exc:
+                raise HHCoverLetterUnavailableError from exc
         if not cover_letter:
             raise HHApplicationError("Cover letter generation failed")
         draft = await self.application_repository.save_draft(

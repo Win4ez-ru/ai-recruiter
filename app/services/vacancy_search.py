@@ -7,9 +7,15 @@ from collections.abc import Awaitable, Callable
 from app.models import Vacancy
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import SearchSummary, VacancyFilterResult
+from app.services.openai_errors import OpenAIServiceError
 from app.services.vacancy_filter import VacancyFilter
 from app.services.vacancy_ranker import VacancyRanker
-from app.sources.hh import HHAPIError, HHClient, vacancy_from_hh
+from app.sources.hh import (
+    HHAPIError,
+    HHClient,
+    HHRemoteError,
+    vacancy_from_hh,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +53,42 @@ class VacancySearchService:
         for query in SEARCH_QUERIES:
             try:
                 items = await self.hh_client.search_vacancies(query, max_results=100)
-            except HHAPIError:
+            except HHRemoteError as exc:
                 summary.errors += 1
-                logger.exception("HH search failed for query %r", query)
-                continue
+                error_code = (
+                    "hh_forbidden"
+                    if exc.status_code == 403
+                    else "hh_rate_limited"
+                    if exc.status_code == 429
+                    else "hh_unavailable"
+                )
+                if error_code not in summary.error_codes:
+                    summary.error_codes.append(error_code)
+                logger.warning(
+                    "HeadHunter search request was rejected",
+                    extra={
+                        "event": "hh_search_rejected",
+                        "query": query,
+                        "status_code": exc.status_code,
+                        "error_type": exc.error_type,
+                        "error_value": exc.error_value,
+                        "request_id": exc.request_id,
+                    },
+                )
+                break
+            except HHAPIError as exc:
+                summary.errors += 1
+                if "hh_unavailable" not in summary.error_codes:
+                    summary.error_codes.append("hh_unavailable")
+                logger.warning(
+                    "HeadHunter search is unavailable",
+                    extra={
+                        "event": "hh_search_unavailable",
+                        "query": query,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                break
             summary.found += len(items)
             for item in items:
                 external_id = str(item.get("id") or "")
@@ -121,9 +159,24 @@ class VacancySearchService:
                     vacancy.id, analysis, self.ranker.model_name
                 )
                 summary.analyzed += 1
+            except OpenAIServiceError as exc:
+                summary.errors += 1
+                if exc.code not in summary.error_codes:
+                    summary.error_codes.append(exc.code)
+                logger.warning(
+                    "Stopping OpenAI analysis for this search run",
+                    extra={
+                        "event": "openai_analysis_stopped",
+                        "error_code": exc.code,
+                        "vacancy_id": vacancy.id,
+                    },
+                )
+                break
             except Exception:
                 summary.errors += 1
-                logger.exception("Failed to save analysis for vacancy %s", vacancy.id)
+                logger.exception(
+                    "Failed to save analysis for vacancy %s", vacancy.id
+                )
 
         refreshed = await self.repository.list_by_external_ids(list(unique_items))
         summary.suitable = sum(
@@ -131,10 +184,14 @@ class VacancySearchService:
             for vacancy in refreshed
             if vacancy.analysis is not None
             and vacancy.analysis.match_score >= self.min_score
-            and (vacancy.application is None or vacancy.application.status != "skipped")
+            and (
+                vacancy.application is None
+                or vacancy.application.status != "skipped"
+            )
         )
         logger.info(
-            "Search complete: found=%s deduplicated=%s new=%s relevant=%s analyzed=%s suitable=%s errors=%s",
+            "Search complete: found=%s deduplicated=%s new=%s relevant=%s "
+            "analyzed=%s suitable=%s errors=%s",
             summary.found,
             summary.after_deduplication,
             summary.new_vacancies,

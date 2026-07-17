@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any
@@ -11,6 +12,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from app.network.retry import RetryPolicy
 from app.schemas import HHResumeData, VacancyCreate
 from app.sources.base import VacancySource
 
@@ -35,6 +37,10 @@ class HHResumeNotFoundError(HHAPIError):
     """Requested HeadHunter resume is unavailable to the current user."""
 
 
+class HHTransportError(HHAPIError):
+    """HeadHunter could not be reached within the configured retry budget."""
+
+
 class HHRemoteError(HHAPIError):
     def __init__(
         self,
@@ -43,12 +49,16 @@ class HHRemoteError(HHAPIError):
         error_value: str | None = None,
         *,
         fallback_url: str | None = None,
+        request_id: str | None = None,
+        retry_after: str | None = None,
     ) -> None:
         super().__init__(f"HH API error: {status_code} {error_type}")
         self.status_code = status_code
         self.error_type = error_type
         self.error_value = error_value
         self.fallback_url = fallback_url
+        self.request_id = request_id
+        self.retry_after = retry_after
 
 
 class _TextExtractor(HTMLParser):
@@ -91,11 +101,20 @@ class HHClient(VacancySource):
         client_id: str = "",
         client_secret: str = "",
         redirect_uri: str = "",
-        timeout: float = 15.0,
-        retries: int = 3,
+        timeout: float | httpx.Timeout = 15.0,
+        retries: int | None = None,
+        retry_policy: RetryPolicy | None = None,
+        proxy_url: str | None = None,
+        trust_env: bool = False,
         http_client: httpx.AsyncClient | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        self.retries = retries
+        if retries is not None and retry_policy is not None:
+            raise ValueError("use either retries or retry_policy")
+        self.retry_policy = retry_policy or RetryPolicy(
+            max_attempts=(retries + 1) if retries is not None else 4
+        )
+        self._sleep = sleep
         self.api_base_url = api_base_url.rstrip("/")
         self.auth_base_url = auth_base_url.rstrip("/")
         self.client_id = client_id
@@ -104,7 +123,9 @@ class HHClient(VacancySource):
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
             base_url=self.api_base_url,
-            timeout=httpx.Timeout(timeout, connect=5.0, read=15.0, write=15.0),
+            timeout=timeout,
+            proxy=proxy_url,
+            trust_env=trust_env,
             headers={
                 "User-Agent": user_agent,
                 "HH-User-Agent": user_agent,
@@ -130,61 +151,92 @@ class HHClient(VacancySource):
         if self._owns_client:
             await self._client.aclose()
 
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        idempotent: bool,
+    ) -> httpx.Response:
+        for attempt in range(1, self.retry_policy.max_attempts + 1):
+            try:
+                response = await self._client.request(
+                    method,
+                    path,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                can_retry = idempotent or isinstance(
+                    exc,
+                    (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
+                )
+                if not can_retry or attempt >= self.retry_policy.max_attempts:
+                    raise HHTransportError(
+                        f"HH {type(exc).__name__} for {path}"
+                    ) from exc
+                await self._wait_before_retry(
+                    path=path,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                continue
+
+            retryable_status = response.status_code == 429 or (
+                idempotent and response.status_code >= 500
+            )
+            if retryable_status and attempt < self.retry_policy.max_attempts:
+                await self._wait_before_retry(
+                    path=path,
+                    attempt=attempt,
+                    status_code=response.status_code,
+                    retry_after=response.headers.get("Retry-After"),
+                    request_id=self._request_id(response),
+                )
+                continue
+            return response
+        raise RuntimeError("HH retry loop exited unexpectedly")
+
+    async def _wait_before_retry(
+        self,
+        *,
+        path: str,
+        attempt: int,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        retry_after: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        delay = self.retry_policy.delay_seconds(
+            attempt,
+            retry_after=retry_after,
+        )
+        logger.warning(
+            "HeadHunter request retry scheduled",
+            extra={
+                "event": "hh_request_retry",
+                "path": path,
+                "attempt": attempt,
+                "max_attempts": self.retry_policy.max_attempts,
+                "status_code": status_code,
+                "error_type": error_type,
+                "request_id": request_id,
+                "retry_delay_seconds": round(delay, 3),
+            },
+        )
+        await self._sleep(delay)
+
     async def _request(
         self, path: str, *, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        last_error: Exception | None = None
-        for attempt in range(self.retries + 1):
-            try:
-                response = await self._client.get(path, params=params)
-                if response.status_code == 404:
-                    raise HHAPIError(f"HH resource not found: {path}")
-                if response.status_code == 429 or response.status_code >= 500:
-                    if attempt >= self.retries:
-                        response.raise_for_status()
-                    retry_after = response.headers.get("Retry-After")
-                    try:
-                        delay = min(float(retry_after), 30.0) if retry_after else 2**attempt
-                    except ValueError:
-                        delay = 2**attempt
-                    logger.warning(
-                        "Temporary HH error %s for %s; retry in %.1fs",
-                        response.status_code,
-                        path,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                response.raise_for_status()
-                if not response.content:
-                    raise HHAPIError(f"Empty HH response for {path}")
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise HHAPIError(f"Unexpected HH response for {path}")
-                return payload
-            except HHAPIError:
-                raise
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code < 500 and exc.response.status_code != 429:
-                    raise HHAPIError(
-                        f"HH returned HTTP {exc.response.status_code} for {path}"
-                    ) from exc
-                last_error = exc
-                if attempt >= self.retries:
-                    break
-                delay = 2**attempt
-                logger.warning("HH request failed for %s; retry in %ss", path, delay)
-                await asyncio.sleep(delay)
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_error = exc
-                if attempt >= self.retries:
-                    break
-                delay = 2**attempt
-                logger.warning("HH request failed for %s; retry in %ss", path, delay)
-                await asyncio.sleep(delay)
-            except (ValueError, TypeError) as exc:
-                raise HHAPIError(f"Invalid HH response for {path}") from exc
-        raise HHAPIError(f"HH request failed for {path}") from last_error
+        response = await self._send("GET", path, params=params, idempotent=True)
+        if response.status_code >= 400:
+            raise self._remote_error(response)
+        return self._json_object(response, path)
 
     @staticmethod
     def code_challenge(code_verifier: str) -> str:
@@ -208,8 +260,10 @@ class HHClient(VacancySource):
 
     async def _token_request(self, data: dict[str, str]) -> dict[str, Any]:
         try:
-            response = await self._client.post("/token", data=data)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            response = await self._send(
+                "POST", "/token", data=data, idempotent=False
+            )
+        except HHTransportError as exc:
             raise HHAuthorizationError("HH token request failed") from exc
         if response.status_code >= 400:
             raise HHAuthorizationError("HH rejected OAuth token request")
@@ -265,33 +319,54 @@ class HHClient(VacancySource):
             error_type,
             error_value,
             fallback_url=fallback_url,
+            request_id=HHClient._request_id(response),
+            retry_after=response.headers.get("Retry-After"),
         )
+
+    @staticmethod
+    def _request_id(response: httpx.Response) -> str | None:
+        request_id = response.headers.get("X-Request-ID")
+        if request_id:
+            return request_id
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if isinstance(payload, dict) and payload.get("request_id"):
+            return str(payload["request_id"])
+        return None
+
+    @staticmethod
+    def _json_object(response: httpx.Response, path: str) -> dict[str, Any]:
+        if not response.content:
+            raise HHAPIError(f"Empty HH response for {path}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HHAPIError(f"Invalid HH response for {path}") from exc
+        if not isinstance(payload, dict):
+            raise HHAPIError(f"Unexpected HH response for {path}")
+        return payload
 
     async def _authorized_get(
         self, path: str, access_token: str
     ) -> dict[str, Any]:
-        try:
-            response = await self._client.get(
-                path, headers={"Authorization": f"Bearer {access_token}"}
-            )
-        except httpx.TimeoutException as exc:
-            raise HHAPIError("HH request timed out") from exc
-        except httpx.TransportError as exc:
-            raise HHAPIError("HH request failed") from exc
+        response = await self._send(
+            "GET",
+            path,
+            headers={"Authorization": f"Bearer {access_token}"},
+            idempotent=True,
+        )
         if response.status_code >= 400:
             error = self._remote_error(response)
             if error.error_type == "oauth" and error.error_value == "token_expired":
                 raise HHTokenExpiredError("HH access token expired") from error
             if error.error_type == "oauth":
-                raise HHAuthorizationError("HH authorization is no longer valid") from error
+                raise HHAuthorizationError(
+                    "HH authorization is no longer valid"
+                ) from error
             raise error
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise HHAPIError("HH returned an invalid response") from exc
-        if not isinstance(payload, dict):
-            raise HHAPIError("HH returned an unexpected response")
-        return payload
+        return self._json_object(response, path)
 
     async def get_current_user(self, access_token: str) -> dict[str, Any]:
         return await self._authorized_get("/me", access_token)
@@ -376,7 +451,9 @@ class HHClient(VacancySource):
             if external_id:
                 unique[external_id] = item
         ordered = sorted(
-            unique.values(), key=lambda item: item.get("published_at") or "", reverse=True
+            unique.values(),
+            key=lambda item: item.get("published_at") or "",
+            reverse=True,
         )
         return ordered[:max_results]
 
@@ -422,7 +499,9 @@ def vacancy_from_hh(
     return VacancyCreate(
         source="hh",
         external_id=str(details.get("id") or search_item.get("id") or ""),
-        title=str(details.get("name") or search_item.get("name") or "Без названия"),
+        title=str(
+            details.get("name") or search_item.get("name") or "Без названия"
+        ),
         company=_name(
             details.get("employer") or search_item.get("employer"), "Не указана"
         ),
@@ -440,7 +519,9 @@ def vacancy_from_hh(
         salary_to=int(salary["to"]) if salary.get("to") is not None else None,
         salary_currency=salary.get("currency"),
         salary_gross=salary.get("gross"),
-        location=_name(details.get("area") or search_item.get("area"), "Не указана"),
+        location=_name(
+            details.get("area") or search_item.get("area"), "Не указана"
+        ),
         work_format=work_format,
         experience=_name(
             details.get("experience") or search_item.get("experience"), "Не указан"

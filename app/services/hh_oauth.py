@@ -9,7 +9,7 @@ from typing import Any
 from app.config import Settings
 from app.models import UserIntegration, utc_now
 from app.repositories.hh_integration_repository import HHIntegrationRepository
-from app.sources.hh import HHAPIError, HHAuthorizationError, HHClient
+from app.sources.hh import HHAPIError, HHAuthorizationError, HHClient, HHRemoteError
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +66,25 @@ class HHOAuthService:
         try:
             resumes = await self.client.get_my_resumes(access_token)
             await self.repository.save_resumes(telegram_user_id, resumes)
-        except HHAPIError:
-            logger.warning("HH OAuth completed, but initial resume sync failed")
+        except HHRemoteError as exc:
+            logger.warning(
+                "HH OAuth completed, but initial resume sync was rejected",
+                extra={
+                    "event": "hh_resume_sync_rejected",
+                    "status_code": exc.status_code,
+                    "error_type": exc.error_type,
+                    "error_value": exc.error_value,
+                    "request_id": exc.request_id,
+                },
+            )
+        except HHAPIError as exc:
+            logger.warning(
+                "HH OAuth completed, but initial resume sync failed",
+                extra={
+                    "event": "hh_resume_sync_failed",
+                    "error_type": type(exc).__name__,
+                },
+            )
         return integration
 
     async def _save_token_payload(

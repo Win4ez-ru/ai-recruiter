@@ -19,6 +19,14 @@ Decision = Literal["strong_apply", "apply", "maybe", "skip"]
 RoleLevel = Literal[
     "intern", "junior", "junior_plus", "middle", "senior", "lead", "unknown"
 ]
+SearchErrorCode = Literal[
+    "hh_forbidden",
+    "hh_rate_limited",
+    "hh_unavailable",
+    "openai_rate_limited",
+    "openai_unavailable",
+    "openai_configuration",
+]
 
 
 class Education(BaseModel):
@@ -105,6 +113,7 @@ class SearchSummary(BaseModel):
     analyzed: int = 0
     suitable: int = 0
     errors: int = 0
+    error_codes: list[SearchErrorCode] = Field(default_factory=list)
 
 
 class StatsResult(BaseModel):

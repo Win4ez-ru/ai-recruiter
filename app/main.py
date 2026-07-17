@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 
+import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -18,6 +19,7 @@ from app.bot.hh_applications import build_hh_applications_router
 from app.config import Settings, get_settings
 from app.database import Database
 from app.logging_config import configure_logging
+from app.network.retry import RetryPolicy
 from app.network.telegram import (
     build_telegram_session,
     telegram_backoff_config,
@@ -68,7 +70,17 @@ async def async_main(settings: Settings) -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         session=build_telegram_session(settings),
     )
-    openai_client = AsyncOpenAI(api_key=settings.openai_api_key, max_retries=2)
+    openai_http_client = httpx.AsyncClient(
+        proxy=settings.openai_proxy_value,
+        timeout=httpx.Timeout(settings.openai_timeout_seconds),
+        trust_env=settings.openai_trust_env,
+    )
+    openai_client = AsyncOpenAI(
+        api_key=settings.openai_api_key,
+        max_retries=settings.openai_max_retries,
+        timeout=settings.openai_timeout_seconds,
+        http_client=openai_http_client,
+    )
     scheduler = None
     callback_server = None
     hh_client = HHClient(
@@ -78,6 +90,20 @@ async def async_main(settings: Settings) -> None:
         client_id=settings.hh_client_id,
         client_secret=settings.hh_client_secret,
         redirect_uri=settings.hh_redirect_uri,
+        timeout=httpx.Timeout(
+            connect=settings.hh_connect_timeout_seconds,
+            read=settings.hh_read_timeout_seconds,
+            write=settings.hh_write_timeout_seconds,
+            pool=settings.hh_pool_timeout_seconds,
+        ),
+        retry_policy=RetryPolicy(
+            max_attempts=settings.hh_retry_attempts,
+            base_delay_seconds=settings.hh_retry_base_delay_seconds,
+            max_delay_seconds=settings.hh_retry_max_delay_seconds,
+            jitter_ratio=settings.hh_retry_jitter_ratio,
+        ),
+        proxy_url=settings.hh_proxy_value,
+        trust_env=settings.hh_trust_env,
     )
 
     try:

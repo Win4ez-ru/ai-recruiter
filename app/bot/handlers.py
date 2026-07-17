@@ -12,6 +12,20 @@ from app.bot.keyboards import connect_hh_keyboard
 
 logger = logging.getLogger(__name__)
 
+SEARCH_ERROR_MESSAGES = {
+    "hh_forbidden": (
+        "HeadHunter отклонил запросы поиска (403). Проверьте сетевой маршрут "
+        "или обратитесь в поддержку HH с request_id из структурированного лога."
+    ),
+    "hh_rate_limited": "HeadHunter ограничил частоту запросов. Повторите позже.",
+    "hh_unavailable": "HeadHunter временно недоступен. Повторите поиск позже.",
+    "openai_rate_limited": "OpenAI ограничил частоту запросов. Повторите позже.",
+    "openai_unavailable": "OpenAI временно недоступен. Повторите позже.",
+    "openai_configuration": (
+        "OpenAI не настроен или выбранная модель недоступна. Проверьте .env."
+    ),
+}
+
 HELP_TEXT = """<b>Персональный бот поиска iOS-вакансий</b>
 
 /search — найти и проанализировать свежие вакансии
@@ -59,6 +73,8 @@ def build_handlers_router(context: BotContext) -> Router:
         try:
             async with context.search_lock:
                 summary = await context.search_service.run(progress=progress)
+            for error_code in summary.error_codes:
+                await message.answer(SEARCH_ERROR_MESSAGES[error_code])
             vacancies = await context.vacancy_repository.list_digest_candidates(
                 context.settings.min_score_to_send,
                 context.settings.max_vacancies_per_digest,

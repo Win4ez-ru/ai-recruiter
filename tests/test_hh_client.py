@@ -3,9 +3,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.network.retry import RetryPolicy
 from app.sources.hh import (
     HHAuthorizationError,
     HHClient,
+    HHRemoteError,
+    HHTransportError,
     HHTokenExpiredError,
     html_to_text,
     vacancy_from_hh,
@@ -208,3 +211,122 @@ async def test_hh_client_rejects_non_applicant_account() -> None:
         client = HHClient("TestAgent/1.0", http_client=http_client)
         with pytest.raises(HHAuthorizationError):
             await client.get_my_resumes("token")
+
+
+@pytest.mark.asyncio
+async def test_hh_client_retries_idempotent_5xx_with_backoff() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(503, json={"errors": [{"type": "unavailable"}]})
+        return httpx.Response(200, json={"id": "42"})
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            retry_policy=RetryPolicy(
+                max_attempts=3,
+                base_delay_seconds=1,
+                max_delay_seconds=10,
+                jitter_ratio=0,
+            ),
+            sleep=sleep,
+        )
+        result = await client.get_vacancy("42")
+
+    assert result["id"] == "42"
+    assert attempts == 3
+    assert delays == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_hh_client_respects_retry_after_and_preserves_request_id() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "7", "X-Request-ID": "request-123"},
+            json={"errors": [{"type": "rate_limit"}]},
+        )
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            retry_policy=RetryPolicy(
+                max_attempts=2,
+                base_delay_seconds=1,
+                max_delay_seconds=10,
+                jitter_ratio=0,
+            ),
+            sleep=sleep,
+        )
+        with pytest.raises(HHRemoteError) as error:
+            await client.get_vacancy("42")
+
+    assert attempts == 2
+    assert delays == [7]
+    assert error.value.status_code == 429
+    assert error.value.request_id == "request-123"
+    assert error.value.retry_after == "7"
+
+
+@pytest.mark.asyncio
+async def test_hh_client_retries_read_timeout_only_for_idempotent_requests() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    policy = RetryPolicy(
+        max_attempts=2,
+        base_delay_seconds=1,
+        max_delay_seconds=2,
+        jitter_ratio=0,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            retry_policy=policy,
+            client_id="client",
+            client_secret="secret",
+            sleep=no_sleep,
+        )
+        with pytest.raises(HHTransportError):
+            await client.get_vacancy("42")
+        assert attempts == 2
+
+        attempts = 0
+        with pytest.raises(HHAuthorizationError):
+            await client.exchange_code(
+                authorization_code="code",
+                code_verifier="verifier",
+            )
+        assert attempts == 1
