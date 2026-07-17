@@ -1,11 +1,44 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+
+
+def _parse_proxy_list(value: Any) -> list[SecretStr]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        normalized = value.replace(";", ",").replace("\n", ",")
+        return [
+            SecretStr(item.strip())
+            for item in normalized.split(",")
+            if item.strip()
+        ]
+    if isinstance(value, (list, tuple)):
+        return [
+            item if isinstance(item, SecretStr) else SecretStr(str(item))
+            for item in value
+        ]
+    raise TypeError("proxy list must be a comma-separated string")
+
+
+def _validate_proxy_url(value: SecretStr | None) -> SecretStr | None:
+    if value is None:
+        return None
+    raw_value = value.get_secret_value().strip()
+    if not raw_value:
+        return None
+    parsed = urlparse(raw_value)
+    if parsed.scheme.lower() not in PROXY_SCHEMES or not parsed.hostname:
+        allowed = ", ".join(sorted(PROXY_SCHEMES))
+        raise ValueError(f"proxy URL must use one of: {allowed}")
+    return SecretStr(raw_value)
 
 
 class Settings(BaseSettings):
@@ -20,8 +53,23 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str
     telegram_user_id: int
+    telegram_direct_enabled: bool = True
+    telegram_proxy_urls: Annotated[list[SecretStr], NoDecode] = Field(
+        default_factory=list
+    )
+    telegram_request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    telegram_polling_timeout_seconds: int = Field(default=30, ge=1, le=60)
+    telegram_polling_backoff_min_seconds: float = Field(default=1.0, gt=0, le=60)
+    telegram_polling_backoff_max_seconds: float = Field(default=30.0, gt=0, le=300)
+    telegram_polling_backoff_factor: float = Field(default=1.7, gt=1, le=10)
+    telegram_polling_backoff_jitter: float = Field(default=0.2, ge=0, le=1)
+    telegram_route_cooldown_seconds: float = Field(default=60.0, ge=0, le=3600)
     openai_api_key: str
     openai_model: str
+    openai_proxy_url: SecretStr | None = None
+    openai_trust_env: bool = False
+    openai_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    openai_max_retries: int = Field(default=3, ge=0, le=10)
     database_url: str = "sqlite+aiosqlite:///./job_agent.db"
     hh_user_agent: str = "KirillJobAgent/1.0"
     hh_client_id: str = ""
@@ -29,6 +77,16 @@ class Settings(BaseSettings):
     hh_redirect_uri: str = "http://127.0.0.1:8080/oauth/hh/callback"
     hh_auth_base_url: str = "https://hh.ru"
     hh_api_base_url: str = "https://api.hh.ru"
+    hh_proxy_url: SecretStr | None = None
+    hh_trust_env: bool = False
+    hh_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    hh_read_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
+    hh_write_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
+    hh_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    hh_retry_attempts: int = Field(default=4, ge=1, le=10)
+    hh_retry_base_delay_seconds: float = Field(default=1.0, gt=0, le=60)
+    hh_retry_max_delay_seconds: float = Field(default=30.0, gt=0, le=300)
+    hh_retry_jitter_ratio: float = Field(default=0.2, ge=0, le=1)
     hh_oauth_state_ttl_seconds: int = Field(default=600, ge=60, le=3600)
     hh_confirmation_ttl_seconds: int = Field(default=900, ge=60, le=3600)
     hh_callback_host: str = "127.0.0.1"
@@ -49,6 +107,40 @@ class Settings(BaseSettings):
             raise ValueError("значение не должно быть пустым")
         return value.strip()
 
+    @field_validator("telegram_proxy_urls", mode="before")
+    @classmethod
+    def parse_telegram_proxy_urls(cls, value: Any) -> list[SecretStr]:
+        return _parse_proxy_list(value)
+
+    @field_validator("telegram_proxy_urls")
+    @classmethod
+    def validate_telegram_proxy_urls(
+        cls, values: list[SecretStr]
+    ) -> list[SecretStr]:
+        return [value for item in values if (value := _validate_proxy_url(item))]
+
+    @field_validator("hh_proxy_url", "openai_proxy_url")
+    @classmethod
+    def validate_optional_proxy(cls, value: SecretStr | None) -> SecretStr | None:
+        return _validate_proxy_url(value)
+
+    @model_validator(mode="after")
+    def validate_network_configuration(self) -> "Settings":
+        if not self.telegram_direct_enabled and not self.telegram_proxy_urls:
+            raise ValueError(
+                "Telegram requires a direct route or at least one proxy URL"
+            )
+        if (
+            self.telegram_polling_backoff_max_seconds
+            < self.telegram_polling_backoff_min_seconds
+        ):
+            raise ValueError(
+                "Telegram polling backoff max must be greater than or equal to min"
+            )
+        if self.hh_retry_max_delay_seconds < self.hh_retry_base_delay_seconds:
+            raise ValueError("HH retry max delay must be greater than or equal to base")
+        return self
+
     @property
     def hh_oauth_configured(self) -> bool:
         return bool(
@@ -60,6 +152,20 @@ class Settings(BaseSettings):
     @property
     def hh_callback_path(self) -> str:
         return urlparse(self.hh_redirect_uri).path or "/oauth/hh/callback"
+
+    @property
+    def telegram_proxy_values(self) -> tuple[str, ...]:
+        return tuple(item.get_secret_value() for item in self.telegram_proxy_urls)
+
+    @property
+    def hh_proxy_value(self) -> str | None:
+        return self.hh_proxy_url.get_secret_value() if self.hh_proxy_url else None
+
+    @property
+    def openai_proxy_value(self) -> str | None:
+        return (
+            self.openai_proxy_url.get_secret_value() if self.openai_proxy_url else None
+        )
 
 
 @lru_cache(maxsize=1)
