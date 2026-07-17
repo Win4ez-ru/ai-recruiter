@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    telegram_bot_token: str
+    telegram_bot_token: SecretStr
     telegram_user_id: int
     telegram_direct_enabled: bool = True
     telegram_proxy_urls: Annotated[list[SecretStr], NoDecode] = Field(
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     telegram_polling_backoff_factor: float = Field(default=1.7, gt=1, le=10)
     telegram_polling_backoff_jitter: float = Field(default=0.2, ge=0, le=1)
     telegram_route_cooldown_seconds: float = Field(default=60.0, ge=0, le=3600)
-    openai_api_key: str
+    openai_api_key: SecretStr
     openai_model: str
     openai_proxy_url: SecretStr | None = None
     openai_trust_env: bool = False
@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./job_agent.db"
     hh_user_agent: str = "KirillJobAgent/1.0"
     hh_client_id: str = ""
-    hh_client_secret: str = ""
+    hh_client_secret: SecretStr = SecretStr("")
     hh_redirect_uri: str = "http://127.0.0.1:8080/oauth/hh/callback"
     hh_auth_base_url: str = "https://hh.ru"
     hh_api_base_url: str = "https://api.hh.ru"
@@ -104,17 +104,30 @@ class Settings(BaseSettings):
     min_score_to_send: int = Field(default=65, ge=0, le=100)
     max_vacancies_per_digest: int = Field(default=10, ge=1, le=50)
     log_level: str = "INFO"
+    log_format: Literal["json", "text"] = "json"
+    log_file_enabled: bool = False
+    log_file_path: Path = PROJECT_ROOT / "logs" / "job-agent.log"
+    log_file_max_bytes: int = Field(default=2_000_000, ge=10_000)
+    log_file_backup_count: int = Field(default=3, ge=0, le=100)
     candidate_profile_path: Path = PROJECT_ROOT / "data" / "candidate_profile.json"
     resume_path: Path = PROJECT_ROOT / "data" / "resume.txt"
 
     @field_validator(
-        "telegram_bot_token", "openai_api_key", "openai_model", "hh_user_agent"
+        "openai_model", "hh_user_agent"
     )
     @classmethod
     def must_not_be_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("значение не должно быть пустым")
         return value.strip()
+
+    @field_validator("telegram_bot_token", "openai_api_key")
+    @classmethod
+    def secret_must_not_be_blank(cls, value: SecretStr) -> SecretStr:
+        raw_value = value.get_secret_value().strip()
+        if not raw_value:
+            raise ValueError("значение не должно быть пустым")
+        return SecretStr(raw_value)
 
     @field_validator("telegram_proxy_urls", mode="before")
     @classmethod
@@ -179,9 +192,21 @@ class Settings(BaseSettings):
     def hh_oauth_configured(self) -> bool:
         return bool(
             self.hh_client_id.strip()
-            and self.hh_client_secret.strip()
+            and self.hh_client_secret.get_secret_value().strip()
             and self.hh_redirect_uri.strip()
         )
+
+    @property
+    def telegram_bot_token_value(self) -> str:
+        return self.telegram_bot_token.get_secret_value()
+
+    @property
+    def openai_api_key_value(self) -> str:
+        return self.openai_api_key.get_secret_value()
+
+    @property
+    def hh_client_secret_value(self) -> str:
+        return self.hh_client_secret.get_secret_value()
 
     @property
     def hh_callback_path(self) -> str:

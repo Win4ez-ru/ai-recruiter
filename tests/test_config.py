@@ -32,6 +32,8 @@ def test_proxy_settings_are_parsed_and_redacted() -> None:
     )
     assert settings.hh_proxy_value == "socks5://hh.example:1080"
     assert "password" not in repr(settings)
+    assert "123456:TEST_TOKEN" not in repr(settings)
+    assert "test-key" not in repr(settings)
 
 
 def test_telegram_requires_at_least_one_route() -> None:

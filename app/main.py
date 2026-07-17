@@ -100,7 +100,7 @@ async def async_main(settings: Settings) -> None:
             status_callback=update_telegram_health,
         )
         bot = Bot(
-            token=settings.telegram_bot_token,
+            token=settings.telegram_bot_token_value,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
             session=telegram_session,
         )
@@ -110,7 +110,7 @@ async def async_main(settings: Settings) -> None:
             trust_env=settings.openai_trust_env,
         )
         openai_client = AsyncOpenAI(
-            api_key=settings.openai_api_key,
+            api_key=settings.openai_api_key_value,
             max_retries=settings.openai_max_retries,
             timeout=settings.openai_timeout_seconds,
             http_client=openai_http_client,
@@ -120,7 +120,7 @@ async def async_main(settings: Settings) -> None:
             api_base_url=settings.hh_api_base_url,
             auth_base_url=settings.hh_auth_base_url,
             client_id=settings.hh_client_id,
-            client_secret=settings.hh_client_secret,
+            client_secret=settings.hh_client_secret_value,
             redirect_uri=settings.hh_redirect_uri,
             timeout=httpx.Timeout(
                 connect=settings.hh_connect_timeout_seconds,
@@ -256,7 +256,14 @@ def run() -> None:
         )
         raise SystemExit(2) from exc
 
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        output_format=settings.log_format,
+        file_enabled=settings.log_file_enabled,
+        file_path=settings.log_file_path,
+        file_max_bytes=settings.log_file_max_bytes,
+        file_backup_count=settings.log_file_backup_count,
+    )
     try:
         asyncio.run(async_main(settings))
     except CandidateProfileError as exc:
