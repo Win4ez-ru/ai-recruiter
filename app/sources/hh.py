@@ -29,6 +29,10 @@ class HHAuthorizationError(HHAPIError):
     """HeadHunter user authorization is absent or invalid."""
 
 
+class HHApplicationAuthorizationError(HHAuthorizationError):
+    """HeadHunter application credentials are absent or invalid."""
+
+
 class HHTokenExpiredError(HHAuthorizationError):
     """HeadHunter access token has expired."""
 
@@ -120,6 +124,8 @@ class HHClient(VacancySource):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
+        self._application_access_token: str | None = None
+        self._application_token_lock = asyncio.Lock()
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
             base_url=self.api_base_url,
@@ -237,6 +243,88 @@ class HHClient(VacancySource):
         if response.status_code >= 400:
             raise self._remote_error(response)
         return self._json_object(response, path)
+
+    @property
+    def _application_auth_configured(self) -> bool:
+        return bool(self.client_id.strip() and self.client_secret.strip())
+
+    async def _get_application_access_token(self) -> str:
+        if not self._application_auth_configured:
+            raise HHApplicationAuthorizationError(
+                "HH application authorization is not configured"
+            )
+        if self._application_access_token:
+            return self._application_access_token
+
+        async with self._application_token_lock:
+            if self._application_access_token:
+                return self._application_access_token
+            payload = await self._application_token_request()
+            self._application_access_token = str(payload["access_token"])
+            logger.info(
+                "HeadHunter application authorization completed",
+                extra={"event": "hh_application_authorized"},
+            )
+            return self._application_access_token
+
+    async def _application_get(
+        self, path: str, *, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if not self._application_auth_configured:
+            return await self._request(path, params=params)
+
+        access_token = await self._get_application_access_token()
+        for authorization_attempt in range(2):
+            response = await self._send(
+                "GET",
+                path,
+                params=params,
+                headers={"Authorization": f"Bearer {access_token}"},
+                idempotent=True,
+            )
+            if response.status_code < 400:
+                return self._json_object(response, path)
+
+            error = self._remote_error(response)
+            if error.error_type != "oauth" or authorization_attempt > 0:
+                raise error
+
+            if self._application_access_token == access_token:
+                self._application_access_token = None
+            logger.warning(
+                "HeadHunter application authorization is no longer valid",
+                extra={
+                    "event": "hh_application_token_invalidated",
+                    "error_value": error.error_value,
+                    "request_id": error.request_id,
+                },
+            )
+            access_token = await self._get_application_access_token()
+
+        raise RuntimeError("HH application authorization loop exited unexpectedly")
+
+    async def _application_token_request(self) -> dict[str, Any]:
+        response = await self._send(
+            "POST",
+            "/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+            idempotent=False,
+        )
+        if response.status_code >= 400:
+            raise HHApplicationAuthorizationError(
+                "HH rejected application authorization"
+            ) from self._remote_error(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HHAPIError("HH returned an invalid application token") from exc
+        if not isinstance(payload, dict) or not payload.get("access_token"):
+            raise HHAPIError("HH returned an incomplete application token")
+        return payload
 
     @staticmethod
     def code_challenge(code_verifier: str) -> str:
@@ -426,7 +514,7 @@ class HHClient(VacancySource):
                 "host": "hh.ru",
                 **filters,
             }
-            payload = await self._request("/vacancies", params=params)
+            payload = await self._application_get("/vacancies", params=params)
             items = payload.get("items") or []
             if not isinstance(items, list):
                 raise HHAPIError("HH returned an invalid vacancy list")
@@ -458,7 +546,7 @@ class HHClient(VacancySource):
         return ordered[:max_results]
 
     async def get_vacancy(self, vacancy_id: str) -> dict[str, Any]:
-        return await self._request(f"/vacancies/{vacancy_id}")
+        return await self._application_get(f"/vacancies/{vacancy_id}")
 
 
 def _name(value: Any, default: str) -> str:

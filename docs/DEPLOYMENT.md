@@ -84,7 +84,10 @@ HTTPX-провайдера, включите его `*_TRUST_ENV=true`. Явны
 
 HH GET-запросы повторяются при connect/read timeout, transport error, `429` и
 временных `5xx`. Учитывается `Retry-After`, задержка ограничена и содержит
-jitter. Обмен одноразового OAuth-кода и refresh token не повторяется после
+jitter. Поиск вакансий использует application-токен, полученный по
+`client_credentials` из `HH_CLIENT_ID` и `HH_CLIENT_SECRET`. Токен кешируется
+на время жизни процесса; при его отзыве клиент один раз получает новый токен и
+повторяет безопасный GET. Обмен одноразового OAuth-кода и refresh token не повторяется после
 неоднозначного read/write timeout: HH мог уже использовать код или заменить
 refresh token. Это предотвращает повреждение OAuth-состояния.
 

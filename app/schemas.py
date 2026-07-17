@@ -20,6 +20,7 @@ RoleLevel = Literal[
     "intern", "junior", "junior_plus", "middle", "senior", "lead", "unknown"
 ]
 SearchErrorCode = Literal[
+    "hh_configuration",
     "hh_forbidden",
     "hh_rate_limited",
     "hh_unavailable",

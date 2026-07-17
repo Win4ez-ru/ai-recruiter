@@ -13,6 +13,10 @@ from app.bot.keyboards import connect_hh_keyboard
 logger = logging.getLogger(__name__)
 
 SEARCH_ERROR_MESSAGES = {
+    "hh_configuration": (
+        "HeadHunter не принял авторизацию приложения. Проверьте "
+        "HH_CLIENT_ID и HH_CLIENT_SECRET в .env."
+    ),
     "hh_forbidden": (
         "HeadHunter отклонил запросы поиска (403). Проверьте сетевой маршрут "
         "или обратитесь в поддержку HH с request_id из структурированного лога."

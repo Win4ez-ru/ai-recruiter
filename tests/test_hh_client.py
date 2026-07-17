@@ -5,6 +5,7 @@ import pytest
 
 from app.network.retry import RetryPolicy
 from app.sources.hh import (
+    HHApplicationAuthorizationError,
     HHAuthorizationError,
     HHClient,
     HHRemoteError,
@@ -18,9 +19,14 @@ from app.sources.hh import (
 @pytest.mark.asyncio
 async def test_hh_client_search_deduplicates_scopes_and_gets_details() -> None:
     requests: list[httpx.Request] = []
+    token_requests = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests
         requests.append(request)
+        if request.url.path == "/token":
+            token_requests += 1
+            return httpx.Response(200, json={"access_token": "application-token"})
         if request.url.path == "/vacancies":
             return httpx.Response(
                 200,
@@ -52,13 +58,33 @@ async def test_hh_client_search_deduplicates_scopes_and_gets_details() -> None:
     async with httpx.AsyncClient(
         transport=transport, base_url="https://api.hh.ru"
     ) as http_client:
-        client = HHClient("TestAgent/1.0", http_client=http_client, retries=0)
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            client_id="client",
+            client_secret="secret",
+            retries=0,
+        )
         items = await client.search_vacancies("iOS", max_results=100)
         details = await client.get_vacancy("42")
 
     assert len(items) == 1
     assert details["id"] == "42"
+    assert token_requests == 1
     assert any(request.headers["HH-User-Agent"] == "TestAgent/1.0" for request in requests)
+    api_requests = [request for request in requests if request.url.path != "/token"]
+    assert all(
+        request.headers["Authorization"] == "Bearer application-token"
+        for request in api_requests
+    )
+    token_body = next(
+        request.content.decode()
+        for request in requests
+        if request.url.path == "/token"
+    )
+    assert "grant_type=client_credentials" in token_body
+    assert "client_id=client" in token_body
+    assert "client_secret=secret" in token_body
     search_request = next(request for request in requests if request.url.path == "/vacancies")
     assert search_request.url.params["period"] == "7"
     assert search_request.url.params["order_by"] == "publication_time"
@@ -76,6 +102,63 @@ def test_hh_html_and_mapping_handle_missing_optional_fields() -> None:
     )
     assert mapped.company == "Не указана"
     assert mapped.salary_from is None
+
+
+@pytest.mark.asyncio
+async def test_hh_client_reports_rejected_application_credentials() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/token"
+        return httpx.Response(
+            400,
+            json={"errors": [{"type": "oauth", "value": "bad_authorization"}]},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            client_id="invalid-client",
+            client_secret="invalid-secret",
+            retries=0,
+        )
+        with pytest.raises(HHApplicationAuthorizationError):
+            await client.search_vacancies("iOS", max_results=1)
+
+
+@pytest.mark.asyncio
+async def test_hh_client_replaces_revoked_application_token_once() -> None:
+    token_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests
+        if request.url.path == "/token":
+            token_requests += 1
+            return httpx.Response(
+                200, json={"access_token": f"application-token-{token_requests}"}
+            )
+        if request.headers["Authorization"] == "Bearer application-token-1":
+            return httpx.Response(
+                403,
+                json={"errors": [{"type": "oauth", "value": "token_revoked"}]},
+            )
+        return httpx.Response(200, json={"id": "42"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            client_id="client",
+            client_secret="secret",
+            retries=0,
+        )
+        details = await client.get_vacancy("42")
+
+    assert details["id"] == "42"
+    assert token_requests == 2
 
 
 @pytest.mark.asyncio
@@ -315,8 +398,6 @@ async def test_hh_client_retries_read_timeout_only_for_idempotent_requests() -> 
             "TestAgent/1.0",
             http_client=http_client,
             retry_policy=policy,
-            client_id="client",
-            client_secret="secret",
             sleep=no_sleep,
         )
         with pytest.raises(HHTransportError):
@@ -324,6 +405,8 @@ async def test_hh_client_retries_read_timeout_only_for_idempotent_requests() -> 
         assert attempts == 2
 
         attempts = 0
+        client.client_id = "client"
+        client.client_secret = "secret"
         with pytest.raises(HHAuthorizationError):
             await client.exchange_code(
                 authorization_code="code",

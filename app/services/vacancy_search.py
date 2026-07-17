@@ -12,6 +12,7 @@ from app.services.vacancy_filter import VacancyFilter
 from app.services.vacancy_ranker import VacancyRanker
 from app.sources.hh import (
     HHAPIError,
+    HHApplicationAuthorizationError,
     HHClient,
     HHRemoteError,
     vacancy_from_hh,
@@ -53,6 +54,19 @@ class VacancySearchService:
         for query in SEARCH_QUERIES:
             try:
                 items = await self.hh_client.search_vacancies(query, max_results=100)
+            except HHApplicationAuthorizationError as exc:
+                summary.errors += 1
+                if "hh_configuration" not in summary.error_codes:
+                    summary.error_codes.append("hh_configuration")
+                logger.warning(
+                    "HeadHunter application authorization failed",
+                    extra={
+                        "event": "hh_application_authorization_failed",
+                        "query": query,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                break
             except HHRemoteError as exc:
                 summary.errors += 1
                 error_code = (
