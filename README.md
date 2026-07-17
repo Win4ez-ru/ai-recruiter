@@ -1,13 +1,15 @@
 # AI Recruiter — персональный Telegram-бот для поиска iOS-вакансий
 
-AI Recruiter получает свежие вакансии через официальный API HeadHunter, удаляет дубликаты, дешево отсеивает нерелевантные позиции, оценивает оставшиеся вакансии через OpenAI и отправляет лучшие варианты в приватный Telegram-чат. Проект рассчитан на одного пользователя и запускается локально или на небольшом VPS.
+AI Recruiter получает свежие вакансии через официальный API HeadHunter, удаляет дубликаты, дешево отсеивает нерелевантные позиции, оценивает оставшиеся вакансии через OpenAI и отправляет лучшие варианты в приватный Telegram-чат. Текущая версия рассчитана на одного пользователя, но имеет переносимый production-контур: provider-specific proxy, retry/backoff, health checks, graceful shutdown, Alembic, PostgreSQL, Docker и cross-platform CI.
+
+Подробный runbook по proxy/VPN, Docker, PaaS, миграциям и честным границам масштабирования находится в [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Коротко: как начать пользоваться
 
 1. Создайте бота через [@BotFather](https://t.me/BotFather) и сохраните токен.
 2. Узнайте свой числовой Telegram ID по инструкции ниже.
-3. Установите Python 3.12+, скопируйте `.env.example` в `.env` и заполните четыре обязательных значения.
-4. Установите зависимости командой `pip install -r requirements.txt`.
+3. Установите Python 3.11+, скопируйте `.env.example` в `.env` и заполните четыре обязательных значения.
+4. Установите зависимости командой `pip install -r requirements-dev.txt` для разработки или `pip install -r requirements.txt` для runtime.
 5. Запустите `python run.py`, откройте созданного бота в Telegram и отправьте `/start`.
 6. Пока нужен бот, процесс `python run.py` должен продолжать работать. Для режима 24/7 разместите его на VPS или домашнем сервере.
 
@@ -26,6 +28,12 @@ Telegram-бот не нужно отдельно «загружать» в Teleg
 - семь отдельных поисковых запросов для iOS, Swift, SwiftUI и стажировок;
 - вакансии за последние 7 дней, Санкт-Петербург и удаленный формат;
 - пагинация, retry/backoff и таймауты для HH API;
+- автоматический Telegram failover между direct, HTTP и SOCKS proxy;
+- отдельные proxy и timeout-политики для Telegram, HH и OpenAI;
+- обработка `Retry-After`, rate limit, `5xx` и transport timeout;
+- JSON-логи в stdout с редактированием секретов;
+- liveness/readiness endpoints и graceful shutdown по `SIGINT`/`SIGTERM`;
+- SQLite для локального режима, PostgreSQL/asyncpg и Alembic для deployment;
 - дедупликация по `source + external_id`;
 - предварительный фильтр без LLM;
 - структурированный LLM-анализ с оценкой 0–100 и Pydantic-валидацией;
@@ -42,7 +50,7 @@ Telegram-бот не нужно отдельно «загружать» в Teleg
 
 ## Архитектура
 
-Приложение представляет собой один асинхронный процесс:
+Приложение представляет собой один асинхронный composition root с разделенными transport, repository и service слоями:
 
 1. `HHClient` делает запросы только к официальному `api.hh.ru`, объединяет выдачу по Санкт-Петербургу и удаленному формату.
 2. `VacancySearchService` дедуплицирует результаты, получает полные карточки и сохраняет новые вакансии.
@@ -53,12 +61,14 @@ Telegram-бот не нужно отдельно «загружать» в Teleg
 7. aiogram обрабатывает команды и inline-кнопки, APScheduler запускает тот же workflow по расписанию.
 8. `HHOAuthService` проверяет одноразовый `state`, обменивает OAuth-код с PKCE и обновляет токены.
 9. `HHApplicationService` готовит черновик и атомарно обрабатывает финальное подтверждение.
+10. `FailoverTelegramSession` изолирует сетевые маршруты Telegram, а `HHClient` и OpenAI используют собственные HTTPX transports.
+11. `HealthRegistry` и общий HTTP-сервер обслуживают OAuth callback, liveness и readiness.
 
-Сбой одной вакансии или внешнего API логируется и не останавливает обработку остальных элементов.
+Сбой одной вакансии или внешнего API логируется и не останавливает процесс. Неоднозначные non-idempotent операции не повторяются вслепую, чтобы не создавать дубликаты или не повреждать OAuth-состояние.
 
 ## Требования
 
-- Python 3.12 или новее;
+- Python 3.11 или новее;
 - Telegram-бот и его токен;
 - OpenAI API key и доступная модель со Structured Outputs;
 - интернет-доступ к `api.hh.ru`, `api.openai.com` и Telegram Bot API.
@@ -90,7 +100,7 @@ git clone https://github.com/Win4ez-ru/AI_recruter.git
 cd AI_recruter
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ~~~
 
 Windows PowerShell:
@@ -100,7 +110,7 @@ git clone https://github.com/Win4ez-ru/AI_recruter.git
 cd AI_recruter
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ~~~
 
 Для Windows `cmd.exe` используйте `.venv\Scripts\activate.bat`.
@@ -125,38 +135,37 @@ Copy-Item .env.example .env
 TELEGRAM_BOT_TOKEN=токен_от_BotFather
 TELEGRAM_USER_ID=ваш_числовой_id
 OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-5.4-mini
+OPENAI_MODEL=модель_с_Structured_Outputs
 DATABASE_URL=sqlite+aiosqlite:///./job_agent.db
+DATABASE_AUTO_CREATE=true
 HH_USER_AGENT=KirillJobAgent/1.0 (your-email@example.com)
 HH_CLIENT_ID=
 HH_CLIENT_SECRET=
-HH_REDIRECT_URI=http://127.0.0.1:8080/oauth/hh/callback
-HH_AUTH_BASE_URL=https://hh.ru
-HH_API_BASE_URL=https://api.hh.ru
-HH_OAUTH_STATE_TTL_SECONDS=600
-HH_CONFIRMATION_TTL_SECONDS=900
-HH_CALLBACK_HOST=127.0.0.1
-HH_CALLBACK_PORT=8080
+HH_REDIRECT_URI=http://localhost:8080/callback
+HTTP_HOST=127.0.0.1
+HTTP_PORT=8080
 SEARCH_INTERVAL_HOURS=12
 MIN_SCORE_TO_SEND=65
 MAX_VACANCIES_PER_DIGEST=10
+LOG_FORMAT=json
+LOG_FILE_ENABLED=false
 ~~~
 
-`OPENAI_MODEL` должен быть доступен вашему API-проекту и поддерживать Structured Outputs. Пример выше можно заменить. Для HH рекомендуется указывать название приложения и контактный email в User-Agent.
+Полный список timeout, retry, proxy, health, pool и logging параметров находится в `.env.example`. `OPENAI_MODEL` должен быть доступен вашему API-проекту и поддерживать Structured Outputs. Для HH рекомендуется указывать название приложения и контактный email в User-Agent.
 
 ## Настройка OAuth HeadHunter
 
 1. Зарегистрируйте приложение в [кабинете разработчика HeadHunter](https://dev.hh.ru/admin) и получите `client_id` и защищенный ключ.
 2. Укажите callback URL приложения. Он должен совпадать с `HH_REDIRECT_URI`.
 3. Заполните `HH_CLIENT_ID`, `HH_CLIENT_SECRET` и `HH_REDIRECT_URI` в `.env`.
-4. Настройте локальный адрес приема callback через `HH_CALLBACK_HOST` и `HH_CALLBACK_PORT`.
+4. Настройте адрес приема callback через `HTTP_HOST` и `HTTP_PORT`.
 5. Запустите бота, выполните `/hh` и нажмите «Подключить HeadHunter».
 
-Для локальной проверки можно зарегистрировать `http://127.0.0.1:8080/oauth/hh/callback`. Для VPS используйте публичный HTTPS URL и направьте его reverse proxy на `HH_CALLBACK_HOST:HH_CALLBACK_PORT`. Путь публичного URL должен совпадать с путем `HH_REDIRECT_URI`.
+Если в кабинете HH уже зарегистрирован `http://localhost:8080/callback`, менять его не нужно: оставьте это же значение в `HH_REDIRECT_URI`. Для VPS используйте публичный HTTPS URL и направьте reverse proxy на `HTTP_HOST:HTTP_PORT`. Redirect URI должен совпадать с настройкой HH полностью, включая host и path.
 
 OAuth использует уникальный `state` со сроком жизни 10 минут и PKCE S256. Хеш `state` привязан к `TELEGRAM_USER_ID` и становится недействительным при первом callback. Access/refresh-токены не передаются в Telegram и не выводятся в логи.
 
-В текущем MVP токены хранятся в SQLite без шифрования at rest: в проекте раньше не было механизма управления ключами. Ограничьте права на файл базы и резервные копии. Для production рекомендуется добавить шифрование отдельным ключом из secret manager.
+Токены HH хранятся в базе без application-level encryption at rest. Ограничьте доступ к базе и резервным копиям; перед multi-tenant SaaS необходимо добавить envelope encryption с ключом из KMS/secret manager.
 
 ## Профиль и резюме
 
@@ -170,7 +179,16 @@ OAuth использует уникальный `state` со сроком жиз
 python run.py
 ~~~
 
-При первом запуске таблицы SQLite создаются автоматически. Для существующей базы `create_all` добавляет новые таблицы интеграции, резюме, расширенных откликов и подтверждений без удаления старых данных. Логи выводятся в консоль и файл `logs/job-agent.log` с ротацией.
+При локальном `DATABASE_AUTO_CREATE=true` таблицы создаются автоматически. В production сначала выполните `alembic upgrade head` и установите `DATABASE_AUTO_CREATE=false`. По умолчанию логи выводятся как JSON в stdout; файловая ротация включается отдельно.
+
+Docker Compose:
+
+~~~bash
+docker compose up --build -d
+docker compose logs -f job-agent
+~~~
+
+Подробные сценарии запуска на VPS, Railway, Render и cloud-платформах описаны в [deployment runbook](docs/DEPLOYMENT.md).
 
 ## Команды Telegram
 
@@ -196,7 +214,7 @@ python run.py
 ## Тесты
 
 ~~~bash
-pytest
+python -m pytest
 ~~~
 
 Внешние API в тестах заменены моками. Проверяются фильтрация, HH-клиент, HTML-форматирование, дедупликация, смена статуса и защита дайджеста от повторной отправки.
@@ -209,12 +227,14 @@ pytest
 AI_recruter/
 ├── app/
 │   ├── bot/              # handlers, callbacks, карточки и клавиатуры
-│   ├── repositories/     # запросы к SQLite
+│   ├── network/          # retry и Telegram transport failover
+│   ├── repositories/     # SQLAlchemy persistence
 │   ├── scheduler/        # периодический запуск поиска
 │   ├── services/         # фильтр, ranker, письма, search workflow, digest
 │   ├── sources/          # официальный HH API
 │   ├── config.py         # pydantic-settings
 │   ├── database.py       # async engine/session factory
+│   ├── health.py         # lifecycle и passive health state
 │   ├── models.py         # SQLAlchemy-модели
 │   ├── schemas.py        # Pydantic-схемы
 │   └── main.py           # сборка зависимостей и lifecycle
@@ -222,8 +242,13 @@ AI_recruter/
 │   ├── candidate_profile.json
 │   └── resume.txt
 ├── tests/
+├── migrations/           # Alembic revisions
+├── docs/                 # deployment runbook
+├── Dockerfile
+├── docker-compose.yml
 ├── .env.example
 ├── requirements.txt
+├── requirements-dev.txt
 └── run.py
 ~~~
 
@@ -235,35 +260,37 @@ AI_recruter/
 
 ### HeadHunter возвращает 400, 403, 429 или captcha
 
-Проверьте `HH_USER_AGENT` и добавьте контактный email. Клиент повторяет 429 и временные 5xx-ошибки ограниченное число раз. Публичная неавторизованная выдача HH может вводить captcha или другие ограничения; MVP не обходит их и не авторизуется от имени пользователя.
+Проверьте `HH_USER_AGENT` и добавьте контактный email. Клиент повторяет `429`, временные `5xx` и безопасные GET-запросы после transport timeout. Публичная выдача HH может вводить CAPTCHA или отклонять конкретный IP; приложение не обходит эти ограничения. Для разрешенного отдельного маршрута используйте `HH_PROXY_URL`.
 
 Для OAuth-методов бот нормализует истекшую или отозванную авторизацию, недоступное резюме, rate limit и временные ошибки без показа сырого JSON, HTML или traceback. CAPTCHA не обходится; используется официальный ручной путь, когда он доступен.
 
 ### OpenAI недоступен
 
-Проверьте ключ, модель, баланс и доступ проекта. Ошибка одной вакансии не завершает поиск: вакансия без сохраненного анализа будет повторно рассмотрена при следующем поиске.
+Проверьте ключ, модель, баланс и доступ проекта. OpenAI имеет отдельные timeout/retry/proxy настройки. Provider-level сбой останавливает дальнейшие LLM-вызовы текущего поиска, но не завершает процесс; необработанные вакансии будут рассмотрены позднее.
 
 ### Telegram не принимает сообщение
 
-Убедитесь, что пользователь первым написал боту и не заблокировал его. Карточки используют HTML escaping и ограничение длины, а технические stack trace остаются только в логах.
+Убедитесь, что пользователь первым написал боту и не заблокировал его. При сетевой блокировке задайте `TELEGRAM_PROXY_URLS`; несколько URL образуют failover-цепочку. Системный VPN работает без изменения кода. Если все маршруты недоступны, процесс остается жив и продолжает backoff, но рабочий внешний маршрут все равно необходим.
 
 ### База заблокирована
 
-Не запускайте несколько копий MVP с одним SQLite-файлом. Остановите лишний процесс и проверьте права записи в каталог проекта.
+Не запускайте несколько копий приложения с одним SQLite-файлом. Остановите лишний процесс и проверьте права записи в каталог проекта.
 
-## Ограничения MVP
+## Границы текущей версии
 
 - один пользователь и один профиль;
-- SQLite без Alembic: новые таблицы добавляются через metadata, а будущие изменения существующих столбцов потребуют отдельной миграции;
+- SQLite подходит только для одной реплики; PostgreSQL и Alembic поддерживаются для deployment;
 - только официальный HeadHunter API;
-- токены OAuth хранятся в SQLite без шифрования at rest;
+- токены OAuth хранятся в базе без application-level шифрования;
 - создание отклика через API недоступно, пока операция отсутствует в публичной OpenAPI HH; используется официальный ручной URL;
 - качество ранжирования и писем зависит от выбранной OpenAI-модели;
 - простой rule-based фильтр может давать пограничные ложные срабатывания;
-- статистика статусов `interview`, `test_task`, `rejected` и `offer` хранится в модели, но MVP не содержит отдельных Telegram-кнопок для всех этих переходов;
-- нет веб-интерфейса, многопользовательского режима и горизонтального масштабирования.
+- статистика статусов `interview`, `test_task`, `rejected` и `offer` хранится в модели, но текущий UI не содержит отдельных Telegram-кнопок для всех этих переходов;
+- нет веб-интерфейса, многопользовательского режима и горизонтального масштабирования;
+- scheduler, search lock и polling живут в одном процессе;
+- OAuth-токены еще не зашифрованы application-level ключом.
 
-## Roadmap после рабочего MVP
+## Следующий архитектурный этап
 
 - Хабр Карьера и вакансии из Telegram-каналов;
 - несколько версий резюме и адаптация под вакансию;
@@ -271,8 +298,9 @@ AI_recruter/
 - статистика конверсии и востребованных навыков;
 - вопросы для собеседования;
 - веб-интерфейс;
-- PostgreSQL;
-- Docker и CI/CD-деплой.
+- tenant-aware PostgreSQL schema и управление пользователями;
+- Telegram webhook ingress, очередь workers и Redis/distributed locks;
+- KMS-шифрование OAuth-токенов и audit log.
 
 ## Безопасность и правила продукта
 
