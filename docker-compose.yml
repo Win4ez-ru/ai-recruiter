@@ -1,0 +1,24 @@
+services:
+  job-agent:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      DATABASE_URL: sqlite+aiosqlite:////app/var/job_agent.db
+      DATABASE_AUTO_CREATE: "false"
+      RUN_DATABASE_MIGRATIONS: "true"
+      LOG_FILE_ENABLED: "false"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "8080:8080"
+    volumes:
+      - job_agent_data:/app/var
+      - ./data:/app/data:ro
+
+volumes:
+  job_agent_data:

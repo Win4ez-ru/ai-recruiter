@@ -1,0 +1,15 @@
+.env
+.git
+.github
+.idea
+.pytest_cache
+.venv
+.vscode
+__pycache__
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+logs
+tests
+.DS_Store
