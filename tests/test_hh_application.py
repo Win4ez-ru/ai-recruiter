@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
 
 import pytest
 import pytest_asyncio
 
 from app.database import Database
-from app.models import Application, HHApplication, utc_now
+from app.models import Application, HHApplication
 from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
@@ -17,8 +16,12 @@ from app.services.hh_application import (
     HHNotAuthorizedError,
     HHResumeSelectionRequired,
 )
-from app.sources.hh import HHAuthorizationError
-from app.sources.hh import HHAPIError, HHRemoteError, HHResumeNotFoundError
+from app.sources.hh import (
+    HHAPIError,
+    HHAuthorizationError,
+    HHRemoteError,
+    HHResumeNotFoundError,
+)
 
 
 @pytest_asyncio.fixture

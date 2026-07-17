@@ -8,8 +8,8 @@ import pytest
 from aiogram.types import CallbackQuery, Chat, Message, User
 from pydantic import Field
 
-from app.bot.hh_applications import CoverLetterEdit, build_hh_applications_router
 from app.bot.callbacks import build_callbacks_router
+from app.bot.hh_applications import CoverLetterEdit, build_hh_applications_router
 from app.bot.hh_callback_data import (
     ConfirmationCallback,
     DraftApplicationCallback,

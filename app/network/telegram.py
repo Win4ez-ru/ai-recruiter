@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
-from aiohttp import ClientError
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.base import BaseSession
@@ -20,6 +19,7 @@ from aiogram.exceptions import (
 from aiogram.methods import TelegramMethod
 from aiogram.types import BotCommand
 from aiogram.utils.backoff import Backoff, BackoffConfig
+from aiohttp import ClientError
 
 from app.config import Settings
 

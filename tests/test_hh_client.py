@@ -8,8 +8,8 @@ from app.sources.hh import (
     HHAuthorizationError,
     HHClient,
     HHRemoteError,
-    HHTransportError,
     HHTokenExpiredError,
+    HHTransportError,
     html_to_text,
     vacancy_from_hh,
 )

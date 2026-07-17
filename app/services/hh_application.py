@@ -8,8 +8,8 @@ from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import ApplicationResult, HHResumeData, PreparedApplication
 from app.services.cover_letter import CoverLetterService
-from app.services.openai_errors import OpenAIServiceError
 from app.services.hh_oauth import HHOAuthService
+from app.services.openai_errors import OpenAIServiceError
 from app.sources.hh import (
     HHAPIError,
     HHAuthorizationError,

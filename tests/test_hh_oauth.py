@@ -11,8 +11,8 @@ from app.config import Settings
 from app.database import Database
 from app.models import OAuthState, utc_now
 from app.repositories.hh_integration_repository import HHIntegrationRepository
-from app.services.hh_oauth import HHOAuthService
 from app.schemas import HHResumeData
+from app.services.hh_oauth import HHOAuthService
 from app.sources.hh import HHAuthorizationError
 
 

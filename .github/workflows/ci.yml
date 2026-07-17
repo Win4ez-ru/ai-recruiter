@@ -53,6 +53,9 @@ jobs:
       - name: Compile sources
         run: python -m compileall -q app tests
 
+      - name: Run static checks
+        run: python -m ruff check app tests migrations run.py
+
       - name: Run tests
         run: python -m pytest -q
 
