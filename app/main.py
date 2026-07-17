@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from collections.abc import Awaitable, Callable
 
 import httpx
 from aiogram import Bot, Dispatcher
@@ -18,9 +19,12 @@ from app.bot.handlers import build_handlers_router
 from app.bot.hh_applications import build_hh_applications_router
 from app.config import Settings, get_settings
 from app.database import Database
+from app.health import HealthRegistry, HealthStatus
 from app.logging_config import configure_logging
 from app.network.retry import RetryPolicy
 from app.network.telegram import (
+    FailoverTelegramSession,
+    TelegramTransportStatus,
     build_telegram_session,
     telegram_backoff_config,
     wait_for_telegram,
@@ -39,7 +43,7 @@ from app.services.cover_letter import CoverLetterService
 from app.services.digest import DigestService
 from app.services.hh_application import HHApplicationService
 from app.services.hh_oauth import HHOAuthService
-from app.services.hh_oauth_callback import HHOAuthCallbackServer
+from app.services.hh_oauth_callback import ApplicationHTTPServer
 from app.services.vacancy_filter import VacancyFilter
 from app.services.vacancy_ranker import VacancyRanker
 from app.services.vacancy_search import VacancySearchService
@@ -62,52 +66,79 @@ BOT_COMMANDS = [
 
 
 async def async_main(settings: Settings) -> None:
+    health = HealthRegistry()
+    health.set_component("database", "starting")
+    health.set_component("telegram", "starting")
+
+    def update_telegram_health(status: TelegramTransportStatus) -> None:
+        if status.routes_in_cooldown == status.configured_routes:
+            state: HealthStatus = "down"
+        elif status.routes_in_cooldown:
+            state = "degraded"
+        else:
+            state = "ok"
+        health.set_component(
+            "telegram",
+            state,
+            detail=f"route={status.active_route}",
+        )
+
     profile = load_candidate_profile(settings.candidate_profile_path)
     resume = load_resume(settings.resume_path)
-    database = Database(settings.database_url)
-    bot = Bot(
-        token=settings.telegram_bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        session=build_telegram_session(settings),
-    )
-    openai_http_client = httpx.AsyncClient(
-        proxy=settings.openai_proxy_value,
-        timeout=httpx.Timeout(settings.openai_timeout_seconds),
-        trust_env=settings.openai_trust_env,
-    )
-    openai_client = AsyncOpenAI(
-        api_key=settings.openai_api_key,
-        max_retries=settings.openai_max_retries,
-        timeout=settings.openai_timeout_seconds,
-        http_client=openai_http_client,
-    )
+    database: Database | None = None
+    telegram_session: FailoverTelegramSession | None = None
+    openai_http_client: httpx.AsyncClient | None = None
+    openai_client: AsyncOpenAI | None = None
+    hh_client: HHClient | None = None
     scheduler = None
-    callback_server = None
-    hh_client = HHClient(
-        settings.hh_user_agent,
-        api_base_url=settings.hh_api_base_url,
-        auth_base_url=settings.hh_auth_base_url,
-        client_id=settings.hh_client_id,
-        client_secret=settings.hh_client_secret,
-        redirect_uri=settings.hh_redirect_uri,
-        timeout=httpx.Timeout(
-            connect=settings.hh_connect_timeout_seconds,
-            read=settings.hh_read_timeout_seconds,
-            write=settings.hh_write_timeout_seconds,
-            pool=settings.hh_pool_timeout_seconds,
-        ),
-        retry_policy=RetryPolicy(
-            max_attempts=settings.hh_retry_attempts,
-            base_delay_seconds=settings.hh_retry_base_delay_seconds,
-            max_delay_seconds=settings.hh_retry_max_delay_seconds,
-            jitter_ratio=settings.hh_retry_jitter_ratio,
-        ),
-        proxy_url=settings.hh_proxy_value,
-        trust_env=settings.hh_trust_env,
-    )
+    callback_server: ApplicationHTTPServer | None = None
 
     try:
+        database = Database(settings.database_url)
+        telegram_session = build_telegram_session(
+            settings,
+            status_callback=update_telegram_health,
+        )
+        bot = Bot(
+            token=settings.telegram_bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            session=telegram_session,
+        )
+        openai_http_client = httpx.AsyncClient(
+            proxy=settings.openai_proxy_value,
+            timeout=httpx.Timeout(settings.openai_timeout_seconds),
+            trust_env=settings.openai_trust_env,
+        )
+        openai_client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            max_retries=settings.openai_max_retries,
+            timeout=settings.openai_timeout_seconds,
+            http_client=openai_http_client,
+        )
+        hh_client = HHClient(
+            settings.hh_user_agent,
+            api_base_url=settings.hh_api_base_url,
+            auth_base_url=settings.hh_auth_base_url,
+            client_id=settings.hh_client_id,
+            client_secret=settings.hh_client_secret,
+            redirect_uri=settings.hh_redirect_uri,
+            timeout=httpx.Timeout(
+                connect=settings.hh_connect_timeout_seconds,
+                read=settings.hh_read_timeout_seconds,
+                write=settings.hh_write_timeout_seconds,
+                pool=settings.hh_pool_timeout_seconds,
+            ),
+            retry_policy=RetryPolicy(
+                max_attempts=settings.hh_retry_attempts,
+                base_delay_seconds=settings.hh_retry_base_delay_seconds,
+                max_delay_seconds=settings.hh_retry_max_delay_seconds,
+                jitter_ratio=settings.hh_retry_jitter_ratio,
+            ),
+            proxy_url=settings.hh_proxy_value,
+            trust_env=settings.hh_trust_env,
+        )
         await database.create_tables()
+        health.set_component("database", "ok")
         vacancy_repository = VacancyRepository(database)
         application_repository = ApplicationRepository(database)
         hh_integration_repository = HHIntegrationRepository(database)
@@ -156,16 +187,21 @@ async def async_main(settings: Settings) -> None:
         dispatcher.include_router(build_callbacks_router(context))
         dispatcher.include_router(build_handlers_router(context))
         scheduler = create_scheduler(bot, context)
-        callback_server = HHOAuthCallbackServer(
-            settings=settings, oauth_service=hh_oauth_service, bot=bot
+        callback_server = ApplicationHTTPServer(
+            settings=settings,
+            oauth_service=hh_oauth_service,
+            bot=bot,
+            health=health,
         )
 
         await callback_server.start()
+        health.mark_ready()
         await wait_for_telegram(
             bot,
             BOT_COMMANDS,
             backoff_config=telegram_backoff_config(settings),
         )
+        health.set_component("telegram", "ok")
         scheduler.start()
         logger.info("Job Agent started")
         await dispatcher.start_polling(
@@ -176,15 +212,35 @@ async def async_main(settings: Settings) -> None:
             close_bot_session=False,
         )
     finally:
+        health.mark_stopping()
         if scheduler and scheduler.running:
-            scheduler.shutdown(wait=False)
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                logger.exception("Failed to stop scheduler")
         if callback_server is not None:
-            await callback_server.close()
-        await hh_client.close()
-        await openai_client.close()
-        await bot.session.close()
-        await database.close()
+            await _close_resource("http_server", callback_server.close)
+        if hh_client is not None:
+            await _close_resource("hh_client", hh_client.close)
+        if openai_client is not None:
+            await _close_resource("openai_client", openai_client.close)
+        elif openai_http_client is not None:
+            await _close_resource("openai_http_client", openai_http_client.aclose)
+        if telegram_session is not None:
+            await _close_resource("telegram_session", telegram_session.close)
+        if database is not None:
+            await _close_resource("database", database.close)
         logger.info("Job Agent stopped")
+
+
+async def _close_resource(
+    name: str,
+    close: Callable[[], Awaitable[None]],
+) -> None:
+    try:
+        await close()
+    except Exception:
+        logger.exception("Failed to close resource %s", name)
 
 
 def run() -> None:

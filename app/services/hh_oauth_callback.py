@@ -7,45 +7,68 @@ from aiogram.exceptions import TelegramAPIError
 from aiohttp import web
 
 from app.config import Settings
+from app.health import HealthRegistry
 from app.services.hh_oauth import HHOAuthService
 from app.sources.hh import HHAPIError, HHAuthorizationError
 
 logger = logging.getLogger(__name__)
 
 
-class HHOAuthCallbackServer:
+class ApplicationHTTPServer:
     def __init__(
-        self, *, settings: Settings, oauth_service: HHOAuthService, bot: Bot
+        self,
+        *,
+        settings: Settings,
+        oauth_service: HHOAuthService,
+        bot: Bot,
+        health: HealthRegistry,
     ) -> None:
         self.settings = settings
         self.oauth_service = oauth_service
         self.bot = bot
+        self.health = health
         self._runner: web.AppRunner | None = None
 
     async def start(self) -> None:
-        if not self.settings.hh_oauth_configured:
-            logger.info("HH OAuth callback server is disabled: credentials are absent")
+        if (
+            not self.settings.hh_oauth_configured
+            and not self.settings.healthcheck_enabled
+        ):
+            logger.info("Application HTTP server is disabled")
             return
         app = web.Application()
-        app.router.add_get(self.settings.hh_callback_path, self._callback)
+        if self.settings.healthcheck_enabled:
+            app.router.add_get(self.settings.health_live_path, self._live)
+            app.router.add_get(self.settings.health_ready_path, self._ready)
+        if self.settings.hh_oauth_configured:
+            app.router.add_get(self.settings.hh_callback_path, self._callback)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(
             self._runner,
-            host=self.settings.hh_callback_host,
-            port=self.settings.hh_callback_port,
+            host=self.settings.http_bind_host,
+            port=self.settings.http_bind_port,
         )
         await site.start()
         logger.info(
-            "HH OAuth callback server started on %s:%s",
-            self.settings.hh_callback_host,
-            self.settings.hh_callback_port,
+            "Application HTTP server started on %s:%s",
+            self.settings.http_bind_host,
+            self.settings.http_bind_port,
         )
 
     async def close(self) -> None:
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+    async def _live(self, _request: web.Request) -> web.Response:
+        return web.json_response(self.health.snapshot(), status=200)
+
+    async def _ready(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            self.health.snapshot(),
+            status=200 if self.health.ready else 503,
+        )
 
     async def _callback(self, request: web.Request) -> web.Response:
         state = request.query.get("state")
@@ -99,3 +122,6 @@ class HHOAuthCallbackServer:
             content_type="text/plain",
             charset="utf-8",
         )
+
+
+HHOAuthCallbackServer = ApplicationHTTPServer

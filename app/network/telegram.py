@@ -72,6 +72,7 @@ class FailoverTelegramSession(BaseSession):
         timeout: float = 30.0,
         cooldown_seconds: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
+        status_callback: Callable[[TelegramTransportStatus], None] | None = None,
     ) -> None:
         if not routes:
             raise ValueError("at least one Telegram route is required")
@@ -79,6 +80,7 @@ class FailoverTelegramSession(BaseSession):
         self._routes = list(routes)
         self._cooldown_seconds = cooldown_seconds
         self._clock = clock
+        self._status_callback = status_callback
         self._active_index = 0
         self._state_lock = asyncio.Lock()
 
@@ -120,6 +122,7 @@ class FailoverTelegramSession(BaseSession):
                     "route": self._routes[index].name,
                 },
             )
+        self._emit_status()
 
     async def _mark_failure(self, index: int, exc: BaseException) -> None:
         async with self._state_lock:
@@ -137,6 +140,14 @@ class FailoverTelegramSession(BaseSession):
                 "error_type": type(exc).__name__,
             },
         )
+        self._emit_status()
+
+    def _emit_status(self) -> None:
+        if self._status_callback is not None:
+            try:
+                self._status_callback(self.status)
+            except Exception:
+                logger.exception("Telegram status callback failed")
 
     async def make_request(
         self,
@@ -211,7 +222,11 @@ class FailoverTelegramSession(BaseSession):
                 )
 
 
-def build_telegram_session(settings: Settings) -> FailoverTelegramSession:
+def build_telegram_session(
+    settings: Settings,
+    *,
+    status_callback: Callable[[TelegramTransportStatus], None] | None = None,
+) -> FailoverTelegramSession:
     routes: list[TelegramRoute] = []
     timeout = settings.telegram_request_timeout_seconds
     if settings.telegram_direct_enabled:
@@ -229,6 +244,7 @@ def build_telegram_session(settings: Settings) -> FailoverTelegramSession:
         routes,
         timeout=timeout,
         cooldown_seconds=settings.telegram_route_cooldown_seconds,
+        status_callback=status_callback,
     )
 
 

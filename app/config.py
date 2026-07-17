@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     hh_confirmation_ttl_seconds: int = Field(default=900, ge=60, le=3600)
     hh_callback_host: str = "127.0.0.1"
     hh_callback_port: int = Field(default=8080, ge=1, le=65535)
+    http_host: str | None = None
+    http_port: int | None = Field(default=None, ge=1, le=65535)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    healthcheck_enabled: bool = True
+    health_live_path: str = "/health/live"
+    health_ready_path: str = "/health/ready"
     search_interval_hours: int = Field(default=12, ge=1)
     min_score_to_send: int = Field(default=65, ge=0, le=100)
     max_vacancies_per_digest: int = Field(default=10, ge=1, le=50)
@@ -135,6 +141,14 @@ class Settings(BaseSettings):
     def validate_optional_proxy(cls, value: SecretStr | None) -> SecretStr | None:
         return _validate_proxy_url(value, allowed_schemes=HTTPX_PROXY_SCHEMES)
 
+    @field_validator("health_live_path", "health_ready_path")
+    @classmethod
+    def validate_http_path(cls, value: str) -> str:
+        path = value.strip()
+        if not path.startswith("/") or "?" in path or "#" in path:
+            raise ValueError("health path must be an absolute URL path")
+        return path
+
     @model_validator(mode="after")
     def validate_network_configuration(self) -> "Settings":
         if not self.telegram_direct_enabled and not self.telegram_proxy_urls:
@@ -150,6 +164,15 @@ class Settings(BaseSettings):
             )
         if self.hh_retry_max_delay_seconds < self.hh_retry_base_delay_seconds:
             raise ValueError("HH retry max delay must be greater than or equal to base")
+        health_paths = {self.health_live_path, self.health_ready_path}
+        if self.healthcheck_enabled and len(health_paths) != 2:
+            raise ValueError("Health paths must be unique")
+        if (
+            self.healthcheck_enabled
+            and self.hh_oauth_configured
+            and self.hh_callback_path in health_paths
+        ):
+            raise ValueError("OAuth callback and health paths must be unique")
         return self
 
     @property
@@ -177,6 +200,14 @@ class Settings(BaseSettings):
         return (
             self.openai_proxy_url.get_secret_value() if self.openai_proxy_url else None
         )
+
+    @property
+    def http_bind_host(self) -> str:
+        return self.http_host or self.hh_callback_host
+
+    @property
+    def http_bind_port(self) -> int:
+        return self.port or self.http_port or self.hh_callback_port
 
 
 @lru_cache(maxsize=1)

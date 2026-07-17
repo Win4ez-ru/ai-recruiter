@@ -53,3 +53,21 @@ def test_proxy_settings_respect_provider_transport_schemes() -> None:
         make_settings(telegram_proxy_urls="socks5h://proxy.example:1080")
     with pytest.raises(ValidationError, match="http, https, socks5, socks5h"):
         make_settings(hh_proxy_url="socks4://proxy.example:1080")
+
+
+def test_platform_port_takes_precedence_over_application_port() -> None:
+    settings = make_settings(
+        port=9000,
+        http_port=8080,
+        hh_callback_port=7000,
+    )
+
+    assert settings.http_bind_port == 9000
+
+
+def test_health_paths_must_be_unique() -> None:
+    with pytest.raises(ValidationError, match="Health paths must be unique"):
+        make_settings(
+            health_live_path="/health",
+            health_ready_path="/health",
+        )
