@@ -1,0 +1,9 @@
+[project]
+name = "ai-recruiter"
+version = "1.0.0"
+description = "Resilient personal Telegram job-search agent"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

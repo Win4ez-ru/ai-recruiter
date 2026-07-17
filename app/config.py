@@ -73,7 +73,14 @@ class Settings(BaseSettings):
     openai_trust_env: bool = False
     openai_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
     openai_max_retries: int = Field(default=3, ge=0, le=10)
-    database_url: str = "sqlite+aiosqlite:///./job_agent.db"
+    database_url: SecretStr = SecretStr(
+        "sqlite+aiosqlite:///./job_agent.db"
+    )
+    database_auto_create: bool = True
+    database_connect_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
+    database_pool_size: int = Field(default=5, ge=1, le=100)
+    database_max_overflow: int = Field(default=10, ge=0, le=200)
+    database_pool_recycle_seconds: int = Field(default=1800, ge=60)
     hh_user_agent: str = "KirillJobAgent/1.0"
     hh_client_id: str = ""
     hh_client_secret: SecretStr = SecretStr("")
@@ -207,6 +214,10 @@ class Settings(BaseSettings):
     @property
     def hh_client_secret_value(self) -> str:
         return self.hh_client_secret.get_secret_value()
+
+    @property
+    def database_url_value(self) -> str:
+        return self.database_url.get_secret_value()
 
     @property
     def hh_callback_path(self) -> str:

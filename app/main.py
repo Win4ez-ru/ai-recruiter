@@ -121,7 +121,13 @@ async def async_main(settings: Settings) -> None:
     callback_server: ApplicationHTTPServer | None = None
 
     try:
-        database = Database(settings.database_url)
+        database = Database(
+            settings.database_url_value,
+            connect_timeout_seconds=settings.database_connect_timeout_seconds,
+            pool_size=settings.database_pool_size,
+            max_overflow=settings.database_max_overflow,
+            pool_recycle_seconds=settings.database_pool_recycle_seconds,
+        )
         telegram_session = build_telegram_session(
             settings,
             status_callback=update_telegram_health,
@@ -164,7 +170,10 @@ async def async_main(settings: Settings) -> None:
             proxy_url=settings.hh_proxy_value,
             trust_env=settings.hh_trust_env,
         )
-        await database.create_tables()
+        if settings.database_auto_create:
+            await database.create_tables()
+        else:
+            await database.check_connection()
         health.set_component("database", "ok")
         vacancy_repository = VacancyRepository(database)
         application_repository = ApplicationRepository(database)

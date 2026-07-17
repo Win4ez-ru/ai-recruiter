@@ -73,3 +73,12 @@ def test_health_paths_must_be_unique() -> None:
             health_live_path="/health",
             health_ready_path="/health",
         )
+
+
+def test_database_credentials_are_redacted() -> None:
+    settings = make_settings(
+        database_url="postgresql://agent:db-password@db.example/jobs"
+    )
+
+    assert settings.database_url_value.endswith("@db.example/jobs")
+    assert "db-password" not in repr(settings)

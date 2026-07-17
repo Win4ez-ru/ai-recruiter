@@ -1,0 +1,9 @@
+Database schema migrations for AI Recruiter.
+
+Create a revision after changing SQLAlchemy models:
+
+    alembic revision --autogenerate -m "describe change"
+
+Apply migrations before starting a production application instance:
+
+    alembic upgrade head
