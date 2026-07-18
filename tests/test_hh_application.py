@@ -12,9 +12,11 @@ from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import HHResumeData, VacancyCreate
 from app.services.hh_application import (
+    MANUAL_RESUME_EXTERNAL_ID,
     HHApplicationService,
     HHNotAuthorizedError,
     HHResumeSelectionRequired,
+    HHTemporaryApplicationError,
 )
 from app.sources.hh import (
     HHAPIError,
@@ -46,12 +48,15 @@ class FakeHHClient:
     def __init__(self, resumes: list[HHResumeData]) -> None:
         self.resumes = resumes
         self.resume_checks = 0
+        self.resume_list_error: Exception | None = None
         self.resume_error: Exception | None = None
         self.vacancy_details: dict = {
             "apply_alternate_url": "https://hh.ru/vacancy/1"
         }
 
     async def get_my_resumes(self, token: str) -> list[HHResumeData]:
+        if self.resume_list_error is not None:
+            raise self.resume_list_error
         return self.resumes
 
     async def get_owned_resume(self, token: str, resume_id: str) -> dict:
@@ -121,6 +126,56 @@ async def test_prepare_application_creates_draft(database: Database) -> None:
     assert preview.cover_letter
     row = await repository.get_owned(preview.draft_id, 42)
     assert row is not None and row.api_status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_prepare_uses_manual_fallback_when_hh_blocks_resume_list(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    service.hh_client.resume_list_error = HHRemoteError(  # type: ignore[attr-defined]
+        403,
+        "forbidden",
+        request_id="request-123",
+    )
+
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    restored = await service.get_preview(
+        user_id=42, application_id=preview.draft_id
+    )
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    row = await repository.get_owned(preview.draft_id, 42)
+
+    assert preview.resume.external_id == MANUAL_RESUME_EXTERNAL_ID
+    assert preview.resume.title == "Выбрать на сайте HeadHunter"
+    assert preview.resumes == []
+    assert restored is not None
+    assert restored.resume.external_id == MANUAL_RESUME_EXTERNAL_ID
+    assert service.hh_client.resume_checks == 0  # type: ignore[attr-defined]
+    assert result.status == "manual_action_required"
+    assert result.manual_url == "https://hh.ru/vacancy/1"
+    assert row is not None
+    assert row.resume_external_id == MANUAL_RESUME_EXTERNAL_ID
+
+
+@pytest.mark.asyncio
+async def test_prepare_does_not_fallback_for_other_hh_failures(
+    database: Database,
+) -> None:
+    service, vacancy_id, _ = await make_service(database)
+    service.hh_client.resume_list_error = HHRemoteError(  # type: ignore[attr-defined]
+        503,
+        "service_unavailable",
+        request_id="request-456",
+    )
+
+    with pytest.raises(HHTemporaryApplicationError):
+        await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
 
 
 @pytest.mark.asyncio

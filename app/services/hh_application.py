@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from app.models import HHApplication, HHResume
@@ -17,6 +18,10 @@ from app.sources.hh import (
     HHRemoteError,
     HHResumeNotFoundError,
 )
+
+logger = logging.getLogger(__name__)
+MANUAL_RESUME_EXTERNAL_ID = "__select_on_hh__"
+MANUAL_RESUME_TITLE = "Выбрать на сайте HeadHunter"
 
 
 class HHApplicationError(RuntimeError):
@@ -57,6 +62,10 @@ class HHTemporaryApplicationError(HHApplicationError):
     user_message = "HeadHunter временно недоступен. Попробуй позже."
 
 
+class HHResumeAccessForbiddenError(HHApplicationError):
+    """HH blocks its own-resume endpoint despite valid applicant OAuth."""
+
+
 class HHCoverLetterUnavailableError(HHApplicationError):
     user_message = "Не удалось создать письмо: OpenAI временно недоступен."
 
@@ -76,6 +85,15 @@ def _resume_data(row: HHResume) -> HHResumeData:
         url=row.url,
         updated_at=row.external_updated_at,
         is_default=row.is_default,
+    )
+
+
+def _manual_resume_data() -> HHResumeData:
+    return HHResumeData(
+        external_id=MANUAL_RESUME_EXTERNAL_ID,
+        title=MANUAL_RESUME_TITLE,
+        status="manual_selection",
+        is_default=True,
     )
 
 
@@ -118,8 +136,20 @@ class HHApplicationService:
         except HHAuthorizationError as exc:
             raise HHNotAuthorizedError from exc
         except HHRemoteError as exc:
+            logger.warning(
+                "HeadHunter resume synchronization was rejected",
+                extra={
+                    "event": "hh_resume_sync_rejected",
+                    "status_code": exc.status_code,
+                    "error_type": exc.error_type,
+                    "error_value": exc.error_value,
+                    "request_id": exc.request_id,
+                },
+            )
             if exc.status_code == 429:
                 raise HHRateLimitError from exc
+            if exc.status_code == 403 and exc.error_type == "forbidden":
+                raise HHResumeAccessForbiddenError from exc
             raise HHTemporaryApplicationError from exc
         except HHAPIError as exc:
             raise HHTemporaryApplicationError from exc
@@ -138,35 +168,47 @@ class HHApplicationService:
         if vacancy is None or vacancy.source != "hh":
             raise HHApplicationError("Vacancy is unavailable")
         token = await self._token(user_id)
-        resumes = await self._sync_resumes(user_id, token)
-        selected = next(
-            (item for item in resumes if item.external_id == resume_id), None
-        )
-        if resume_id and selected is None:
-            raise HHResumeUnavailableError
-        if selected is None:
-            selected = next((item for item in resumes if item.is_default), None)
-        if selected is None and len(resumes) == 1:
-            selected = resumes[0]
-        if selected is None:
-            raise HHResumeSelectionRequired([_resume_data(item) for item in resumes])
         try:
-            await self.hh_client.get_owned_resume(token, selected.external_id)
-        except HHResumeNotFoundError as exc:
-            raise HHResumeUnavailableError from exc
-        except HHRemoteError as exc:
-            if exc.status_code == 429:
-                raise HHRateLimitError from exc
-            raise HHTemporaryApplicationError from exc
-        except HHAPIError as exc:
-            raise HHTemporaryApplicationError from exc
-        await self.integration_repository.set_default_resume(
-            telegram_user_id=user_id, external_id=selected.external_id
-        )
+            resumes = await self._sync_resumes(user_id, token)
+        except HHResumeAccessForbiddenError:
+            logger.warning(
+                "Using manual HeadHunter resume selection fallback",
+                extra={
+                    "event": "hh_manual_resume_fallback",
+                    "vacancy_id": vacancy.id,
+                },
+            )
+            selected_data = _manual_resume_data()
+            available_resumes: list[HHResumeData] = []
+        else:
+            selected = next(
+                (item for item in resumes if item.external_id == resume_id), None
+            )
+            if resume_id and selected is None:
+                raise HHResumeUnavailableError
+            if selected is None:
+                selected = next((item for item in resumes if item.is_default), None)
+            if selected is None and len(resumes) == 1:
+                selected = resumes[0]
+            if selected is None:
+                raise HHResumeSelectionRequired(
+                    [_resume_data(item) for item in resumes]
+                )
+            await self.integration_repository.set_default_resume(
+                telegram_user_id=user_id, external_id=selected.external_id
+            )
+            refreshed_resumes = await self.integration_repository.list_resumes(user_id)
+            selected_data = next(
+                _resume_data(item)
+                for item in refreshed_resumes
+                if item.external_id == selected.external_id
+            )
+            available_resumes = [_resume_data(item) for item in refreshed_resumes]
+
         existing = await self.application_repository.find_by_identity(
             telegram_user_id=user_id,
             vacancy_external_id=vacancy.external_id,
-            resume_external_id=selected.external_id,
+            resume_external_id=selected_data.external_id,
         )
         cover_letter = existing.cover_letter if existing else None
         if not cover_letter:
@@ -180,14 +222,8 @@ class HHApplicationService:
             telegram_user_id=user_id,
             vacancy_id=vacancy.id,
             vacancy_external_id=vacancy.external_id,
-            resume_external_id=selected.external_id,
+            resume_external_id=selected_data.external_id,
             cover_letter=cover_letter,
-        )
-        refreshed_resumes = await self.integration_repository.list_resumes(user_id)
-        selected_data = next(
-            _resume_data(item)
-            for item in refreshed_resumes
-            if item.external_id == selected.external_id
         )
         return PreparedApplication(
             draft_id=draft.id,
@@ -196,7 +232,7 @@ class HHApplicationService:
             company=vacancy.company,
             vacancy_url=vacancy.url,
             resume=selected_data,
-            resumes=[_resume_data(item) for item in refreshed_resumes],
+            resumes=available_resumes,
             cover_letter=draft.cover_letter,
         )
 
@@ -209,21 +245,31 @@ class HHApplicationService:
         vacancy = await self.vacancy_repository.get_by_id(draft.vacancy_id)
         if vacancy is None:
             return None
-        resumes = await self.integration_repository.list_resumes(user_id)
-        selected = next(
-            (item for item in resumes if item.external_id == draft.resume_external_id),
-            None,
-        )
-        if selected is None:
-            return None
+        if draft.resume_external_id == MANUAL_RESUME_EXTERNAL_ID:
+            selected_data = _manual_resume_data()
+            available_resumes: list[HHResumeData] = []
+        else:
+            resumes = await self.integration_repository.list_resumes(user_id)
+            selected = next(
+                (
+                    item
+                    for item in resumes
+                    if item.external_id == draft.resume_external_id
+                ),
+                None,
+            )
+            if selected is None:
+                return None
+            selected_data = _resume_data(selected)
+            available_resumes = [_resume_data(item) for item in resumes]
         return PreparedApplication(
             draft_id=draft.id,
             vacancy_id=vacancy.id,
             vacancy_title=vacancy.title,
             company=vacancy.company,
             vacancy_url=vacancy.url,
-            resume=_resume_data(selected),
-            resumes=[_resume_data(item) for item in resumes],
+            resume=selected_data,
+            resumes=available_resumes,
             cover_letter=draft.cover_letter,
         )
 
@@ -286,77 +332,78 @@ class HHApplicationService:
                 status="manual_action_required",
                 message="Вакансия больше недоступна.",
             )
-        try:
-            access_token = await self._token(user_id)
-            await self.hh_client.get_owned_resume(
-                access_token, application.resume_external_id
-            )
-        except HHResumeNotFoundError:
-            await self.application_repository.mark_manual_action(
-                application.id,
-                code="resume_not_found",
-                message="Резюме больше недоступно.",
-            )
-            return ApplicationResult(
-                status="manual_action_required",
-                message="Резюме больше недоступно. Выбери другое.",
-                manual_url=vacancy.url,
-            )
-        except HHNotAuthorizedError:
-            await self.application_repository.mark_manual_action(
-                application.id,
-                code="authorization_expired",
-                message="Авторизация HeadHunter истекла.",
-            )
-            return ApplicationResult(
-                status="manual_action_required",
-                message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
-                manual_url=vacancy.url,
-            )
-        except HHAuthorizationError:
-            await self.application_repository.mark_manual_action(
-                application.id,
-                code="authorization_expired",
-                message="Авторизация HeadHunter истекла.",
-            )
-            return ApplicationResult(
-                status="manual_action_required",
-                message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
-                manual_url=vacancy.url,
-            )
-        except HHRemoteError as exc:
-            is_rate_limit = exc.status_code == 429
-            message = (
-                "HeadHunter временно ограничил число запросов. Проверь отклики "
-                "на сайте и попробуй позже."
-                if is_rate_limit
-                else "HeadHunter временно недоступен. Проверь отклики на сайте."
-            )
-            await self.application_repository.mark_manual_action(
-                application.id,
-                code="rate_limit" if is_rate_limit else "temporary_hh_error",
-                message=message,
-            )
-            return ApplicationResult(
-                status="manual_action_required",
-                message=message,
-                manual_url=vacancy.url,
-            )
-        except HHAPIError:
-            message = (
-                "Не удалось подтвердить результат проверки в HeadHunter. "
-                "Проверь отклики на сайте."
-            )
-            await self.application_repository.mark_manual_action(
-                application.id,
-                code="hh_request_failed",
-                message=message,
-            )
-            return ApplicationResult(
-                status="manual_action_required",
-                message=message,
-                manual_url=vacancy.url,
-            )
+        if application.resume_external_id != MANUAL_RESUME_EXTERNAL_ID:
+            try:
+                access_token = await self._token(user_id)
+                await self.hh_client.get_owned_resume(
+                    access_token, application.resume_external_id
+                )
+            except HHResumeNotFoundError:
+                await self.application_repository.mark_manual_action(
+                    application.id,
+                    code="resume_not_found",
+                    message="Резюме больше недоступно.",
+                )
+                return ApplicationResult(
+                    status="manual_action_required",
+                    message="Резюме больше недоступно. Выбери другое.",
+                    manual_url=vacancy.url,
+                )
+            except HHNotAuthorizedError:
+                await self.application_repository.mark_manual_action(
+                    application.id,
+                    code="authorization_expired",
+                    message="Авторизация HeadHunter истекла.",
+                )
+                return ApplicationResult(
+                    status="manual_action_required",
+                    message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
+                    manual_url=vacancy.url,
+                )
+            except HHAuthorizationError:
+                await self.application_repository.mark_manual_action(
+                    application.id,
+                    code="authorization_expired",
+                    message="Авторизация HeadHunter истекла.",
+                )
+                return ApplicationResult(
+                    status="manual_action_required",
+                    message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
+                    manual_url=vacancy.url,
+                )
+            except HHRemoteError as exc:
+                is_rate_limit = exc.status_code == 429
+                message = (
+                    "HeadHunter временно ограничил число запросов. Проверь отклики "
+                    "на сайте и попробуй позже."
+                    if is_rate_limit
+                    else "HeadHunter временно недоступен. Проверь отклики на сайте."
+                )
+                await self.application_repository.mark_manual_action(
+                    application.id,
+                    code="rate_limit" if is_rate_limit else "temporary_hh_error",
+                    message=message,
+                )
+                return ApplicationResult(
+                    status="manual_action_required",
+                    message=message,
+                    manual_url=vacancy.url,
+                )
+            except HHAPIError:
+                message = (
+                    "Не удалось подтвердить результат проверки в HeadHunter. "
+                    "Проверь отклики на сайте."
+                )
+                await self.application_repository.mark_manual_action(
+                    application.id,
+                    code="hh_request_failed",
+                    message=message,
+                )
+                return ApplicationResult(
+                    status="manual_action_required",
+                    message=message,
+                    manual_url=vacancy.url,
+                )
 
         try:
             details = await self.hh_client.get_vacancy(vacancy.external_id)
