@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import ssl
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import pytest
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import GetMe, GetUpdates, SendMessage, TelegramMethod
 from aiogram.types import BotCommand
 from aiogram.utils.backoff import BackoffConfig
 
+from app.config import Settings
 from app.network.telegram import (
     FailoverTelegramSession,
     TelegramRoute,
+    build_telegram_session,
     wait_for_telegram,
 )
 
@@ -53,6 +57,25 @@ class FakeSession(BaseSession):
 
 def network_error(method: TelegramMethod[Any]) -> TelegramNetworkError:
     return TelegramNetworkError(method=method, message="network unavailable")
+
+
+@pytest.mark.asyncio
+async def test_proxy_route_keeps_verified_tls_context() -> None:
+    settings = Settings(
+        telegram_bot_token="123456:TEST_TOKEN",
+        telegram_user_id=42,
+        telegram_direct_enabled=False,
+        telegram_proxy_urls="socks5://proxy.example:1080",
+        openai_api_key="test-key",
+        openai_model="test-model",
+    )
+
+    session = build_telegram_session(settings)
+    route_session = session._routes[0].session  # noqa: SLF001
+
+    assert isinstance(route_session, AiohttpSession)
+    assert isinstance(route_session._connector_init["ssl"], ssl.SSLContext)  # noqa: SLF001
+    await session.close()
 
 
 @pytest.mark.asyncio

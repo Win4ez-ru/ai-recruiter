@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
+import certifi
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.base import BaseSession
@@ -231,13 +233,13 @@ def build_telegram_session(
     timeout = settings.telegram_request_timeout_seconds
     if settings.telegram_direct_enabled:
         routes.append(
-            TelegramRoute("direct", AiohttpSession(timeout=timeout))
+            TelegramRoute("direct", _build_route_session(timeout=timeout))
         )
     for index, proxy_url in enumerate(settings.telegram_proxy_values, start=1):
         routes.append(
             TelegramRoute(
                 f"proxy-{index}",
-                AiohttpSession(proxy=proxy_url, timeout=timeout),
+                _build_route_session(proxy_url=proxy_url, timeout=timeout),
             )
         )
     return FailoverTelegramSession(
@@ -246,6 +248,21 @@ def build_telegram_session(
         cooldown_seconds=settings.telegram_route_cooldown_seconds,
         status_callback=status_callback,
     )
+
+
+def _build_route_session(
+    *,
+    timeout: float,
+    proxy_url: str | None = None,
+) -> AiohttpSession:
+    session = AiohttpSession(proxy=proxy_url, timeout=timeout)
+    # AiohttpSession replaces its connector settings when a proxy is enabled.
+    # Restore the verified CA context so aiohttp-socks never falls back to an
+    # incomplete interpreter-level certificate store.
+    session._connector_init["ssl"] = ssl.create_default_context(  # noqa: SLF001
+        cafile=certifi.where()
+    )
+    return session
 
 
 def telegram_backoff_config(settings: Settings) -> BackoffConfig:
