@@ -228,6 +228,23 @@ class HHApplicationRepository:
             await session.refresh(row)
             return row
 
+    async def mark_submitted(
+        self, application_id: int, *, external_id: str | None
+    ) -> HHApplication:
+        async with self.database.session_factory() as session:
+            row = await session.get(HHApplication, application_id)
+            if row is None:
+                raise LookupError("Application draft not found")
+            row.process_status = "submitted"
+            row.api_status = "submitted"
+            row.external_application_id = external_id
+            row.submitted_at = utc_now()
+            row.error_code = None
+            row.error_message = None
+            await session.commit()
+            await session.refresh(row)
+            return row
+
     async def count_for_identity(
         self,
         *,

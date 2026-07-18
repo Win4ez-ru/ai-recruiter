@@ -498,6 +498,49 @@ class HHClient(VacancySource):
                 raise HHResumeNotFoundError("HH resume is unavailable") from exc
             raise
 
+    async def apply_to_vacancy(
+        self,
+        access_token: str,
+        *,
+        resume_id: str,
+        vacancy_id: str,
+        message: str,
+    ) -> str | None:
+        path = "/negotiations/response"
+        response = await self._send(
+            "POST",
+            path,
+            data={
+                "resume_id": resume_id,
+                "vacancy_id": vacancy_id,
+                "message": message,
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+            idempotent=False,
+        )
+        if response.status_code >= 400:
+            error = self._remote_error(response)
+            if error.error_type == "oauth" and error.error_value == "token_expired":
+                raise HHTokenExpiredError("HH access token expired") from error
+            if error.error_type == "oauth":
+                raise HHAuthorizationError(
+                    "HH authorization is no longer valid"
+                ) from error
+            raise error
+        if response.status_code != 201:
+            raise HHAPIError(
+                f"Unexpected HH application response: {response.status_code}"
+            )
+        if not response.content:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if isinstance(payload, dict) and payload.get("id") is not None:
+            return str(payload["id"])
+        return None
+
     async def _search_scope(
         self, query: str, max_results: int, filters: dict[str, Any]
     ) -> list[dict[str, Any]]:

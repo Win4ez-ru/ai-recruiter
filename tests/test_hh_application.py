@@ -7,6 +7,7 @@ import pytest_asyncio
 
 from app.database import Database
 from app.models import Application, HHApplication
+from app.repositories.application_repository import ApplicationRepository
 from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
@@ -22,7 +23,7 @@ from app.sources.hh import (
     HHAPIError,
     HHAuthorizationError,
     HHRemoteError,
-    HHResumeNotFoundError,
+    HHTransportError,
 )
 
 
@@ -47,9 +48,9 @@ class FakeOAuth:
 class FakeHHClient:
     def __init__(self, resumes: list[HHResumeData]) -> None:
         self.resumes = resumes
-        self.resume_checks = 0
         self.resume_list_error: Exception | None = None
-        self.resume_error: Exception | None = None
+        self.application_error: Exception | None = None
+        self.application_calls = 0
         self.vacancy_details: dict = {
             "apply_alternate_url": "https://hh.ru/vacancy/1"
         }
@@ -59,14 +60,21 @@ class FakeHHClient:
             raise self.resume_list_error
         return self.resumes
 
-    async def get_owned_resume(self, token: str, resume_id: str) -> dict:
-        self.resume_checks += 1
-        if self.resume_error is not None:
-            raise self.resume_error
-        return {"id": resume_id}
-
     async def get_vacancy(self, vacancy_id: str) -> dict:
         return {"id": vacancy_id, **self.vacancy_details}
+
+    async def apply_to_vacancy(
+        self,
+        token: str,
+        *,
+        resume_id: str,
+        vacancy_id: str,
+        message: str,
+    ) -> str | None:
+        self.application_calls += 1
+        if self.application_error is not None:
+            raise self.application_error
+        return "negotiation-1"
 
 
 class FakeCoverLetter:
@@ -82,6 +90,7 @@ async def make_service(
     *,
     resumes: list[HHResumeData] | None = None,
     oauth_token: str | None = "token",
+    default_resume_id: str = "",
 ) -> tuple[HHApplicationService, int, HHApplicationRepository]:
     vacancy_repository = VacancyRepository(database)
     vacancy, _ = await vacancy_repository.create_if_new(
@@ -94,6 +103,7 @@ async def make_service(
     )
     integration_repository = HHIntegrationRepository(database)
     application_repository = HHApplicationRepository(database)
+    status_repository = ApplicationRepository(database)
     client = FakeHHClient(
         resumes
         or [
@@ -109,9 +119,11 @@ async def make_service(
         oauth_service=FakeOAuth(oauth_token),  # type: ignore[arg-type]
         integration_repository=integration_repository,
         application_repository=application_repository,
+        status_repository=status_repository,
         vacancy_repository=vacancy_repository,
         cover_letter_service=FakeCoverLetter(),  # type: ignore[arg-type]
         confirmation_ttl_seconds=900,
+        default_resume_id=default_resume_id,
     )
     return service, vacancy.id, application_repository
 
@@ -156,11 +168,43 @@ async def test_prepare_uses_manual_fallback_when_hh_blocks_resume_list(
     assert preview.resumes == []
     assert restored is not None
     assert restored.resume.external_id == MANUAL_RESUME_EXTERNAL_ID
-    assert service.hh_client.resume_checks == 0  # type: ignore[attr-defined]
+    assert service.hh_client.application_calls == 0  # type: ignore[attr-defined]
     assert result.status == "manual_action_required"
     assert result.manual_url == "https://hh.ru/vacancy/1"
     assert row is not None
     assert row.resume_external_id == MANUAL_RESUME_EXTERNAL_ID
+
+
+@pytest.mark.asyncio
+async def test_configured_resume_fallback_can_submit(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(
+        database,
+        default_resume_id="configured-resume",
+    )
+    service.hh_client.resume_list_error = HHRemoteError(  # type: ignore[attr-defined]
+        403,
+        "forbidden",
+    )
+
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    restored = await service.get_preview(
+        user_id=42, application_id=preview.draft_id
+    )
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    row = await repository.get_owned(preview.draft_id, 42)
+
+    assert preview.resume.external_id == "configured-resume"
+    assert restored is not None
+    assert restored.resume.external_id == "configured-resume"
+    assert result.status == "submitted"
+    assert row is not None and row.api_status == "submitted"
 
 
 @pytest.mark.asyncio
@@ -215,7 +259,7 @@ async def test_first_confirmation_does_not_finalize_application(
 
 
 @pytest.mark.asyncio
-async def test_final_confirmation_is_one_time_and_uses_manual_fallback(
+async def test_final_confirmation_submits_only_once(
     database: Database,
 ) -> None:
     service, vacancy_id, repository = await make_service(database)
@@ -232,11 +276,13 @@ async def test_final_confirmation_is_one_time_and_uses_manual_fallback(
     )
     row = await repository.get_owned(preview.draft_id, 42)
 
-    assert first.status == "manual_action_required"
-    assert first.manual_url == "https://hh.ru/vacancy/1"
-    assert second.status == "failed"
+    assert first.status == "submitted"
+    assert first.external_id == "negotiation-1"
+    assert second.status == "submitted"
     assert row is not None and row.attempts == 1
-    assert row.api_status == "manual_action_required"
+    assert row.api_status == "submitted"
+    assert row.external_application_id == "negotiation-1"
+    assert service.hh_client.application_calls == 1  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -255,7 +301,8 @@ async def test_concurrent_confirmation_acquires_only_one_submission(
     )
     row = await repository.get_owned(preview.draft_id, 42)
 
-    assert sum(result.status == "manual_action_required" for result in results) == 1
+    assert sum(result.status == "submitted" for result in results) >= 1
+    assert service.hh_client.application_calls == 1  # type: ignore[attr-defined]
     assert row is not None and row.attempts == 1
 
 
@@ -305,7 +352,7 @@ async def test_unique_identity_reuses_single_draft(database: Database) -> None:
 
 
 @pytest.mark.asyncio
-async def test_manual_fallback_does_not_mark_vacancy_applied(database: Database) -> None:
+async def test_successful_submission_marks_vacancy_applied(database: Database) -> None:
     service, vacancy_id, _ = await make_service(database)
     preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
     confirmation = await service.create_confirmation(
@@ -316,11 +363,34 @@ async def test_manual_fallback_does_not_mark_vacancy_applied(database: Database)
     async with database.session_factory() as session:
         legacy = await session.get(Application, vacancy_id)
         hh_application = await session.get(HHApplication, preview.draft_id)
-    assert legacy is None or legacy.status != "applied"
+    assert legacy is not None and legacy.status == "applied"
     assert hh_application is not None
     assert hh_application.confirmed_at is not None
     assert hh_application.submitting_at is not None
-    assert hh_application.submitted_at is None
+    assert hh_application.submitted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_already_applied_is_treated_as_submitted(database: Database) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    service.hh_client.application_error = HHRemoteError(  # type: ignore[attr-defined]
+        403,
+        "negotiations",
+        "already_applied",
+    )
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    row = await repository.get_owned(preview.draft_id, 42)
+
+    assert result.status == "submitted"
+    assert "уже существует" in result.message
+    assert row is not None and row.api_status == "submitted"
 
 
 @pytest.mark.asyncio
@@ -349,18 +419,19 @@ async def test_required_test_uses_manual_action_message(database: Database) -> N
 @pytest.mark.parametrize(
     ("error", "expected_code"),
     [
-        (HHResumeNotFoundError("missing"), "resume_not_found"),
+        (HHRemoteError(403, "negotiations", "resume_not_found"), "resume_not_found"),
         (HHRemoteError(429, "rate_limit"), "rate_limit"),
         (HHRemoteError(503, "service_unavailable"), "temporary_hh_error"),
+        (HHTransportError("unknown result"), "submission_result_unknown"),
         (HHAPIError("timeout"), "hh_request_failed"),
     ],
 )
-async def test_final_preflight_failures_use_safe_manual_result(
+async def test_submission_failures_use_safe_manual_result(
     database: Database, error: Exception, expected_code: str
 ) -> None:
     service, vacancy_id, repository = await make_service(database)
     preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
-    service.hh_client.resume_error = error  # type: ignore[attr-defined]
+    service.hh_client.application_error = error  # type: ignore[attr-defined]
     confirmation = await service.create_confirmation(
         user_id=42, application_id=preview.draft_id
     )

@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     hh_user_agent: str = "KirillJobAgent/1.0"
     hh_client_id: str = ""
     hh_client_secret: SecretStr = SecretStr("")
+    hh_default_resume_id: str = ""
     hh_redirect_uri: str = "http://127.0.0.1:8080/oauth/hh/callback"
     hh_auth_base_url: str = "https://hh.ru"
     hh_api_base_url: str = "https://api.hh.ru"

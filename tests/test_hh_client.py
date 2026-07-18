@@ -201,6 +201,61 @@ async def test_hh_client_gets_current_users_resumes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hh_client_submits_official_applicant_response() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(201, json={"id": "negotiation-42"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient("TestAgent/1.0", http_client=http_client, retries=0)
+        result = await client.apply_to_vacancy(
+            "applicant-token",
+            resume_id="resume-1",
+            vacancy_id="vacancy-1",
+            message="Персональное сопроводительное письмо",
+        )
+
+    assert result == "negotiation-42"
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.method == "POST"
+    assert request.url.path == "/negotiations/response"
+    assert request.headers["Authorization"] == "Bearer applicant-token"
+    body = request.content.decode()
+    assert "resume_id=resume-1" in body
+    assert "vacancy_id=vacancy-1" in body
+    assert "message=" in body
+
+
+@pytest.mark.asyncio
+async def test_hh_client_does_not_retry_uncertain_application_timeout() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient("TestAgent/1.0", http_client=http_client)
+        with pytest.raises(HHTransportError):
+            await client.apply_to_vacancy(
+                "applicant-token",
+                resume_id="resume-1",
+                vacancy_id="vacancy-1",
+                message="Письмо",
+            )
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_hh_client_exchanges_oauth_code_with_pkce() -> None:
     captured: list[httpx.Request] = []
 

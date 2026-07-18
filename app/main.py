@@ -200,9 +200,11 @@ async def async_main(settings: Settings) -> None:
             oauth_service=hh_oauth_service,
             integration_repository=hh_integration_repository,
             application_repository=hh_application_repository,
+            status_repository=application_repository,
             vacancy_repository=vacancy_repository,
             cover_letter_service=cover_letter_service,
             confirmation_ttl_seconds=settings.hh_confirmation_ttl_seconds,
+            default_resume_id=settings.hh_default_resume_id,
         )
         context = BotContext(
             settings=settings,
