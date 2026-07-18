@@ -33,7 +33,7 @@ SearchErrorCode = Literal[
 class Education(BaseModel):
     university: str
     program: str
-    year: int
+    graduation_year: int
 
 
 class ExperienceProfile(BaseModel):
