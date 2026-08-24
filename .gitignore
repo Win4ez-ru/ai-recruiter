@@ -3,8 +3,15 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-job_agent.db
+.coverage
+coverage.xml
+htmlcov/
+*.db
+*.db-shm
+*.db-wal
 logs/
 .DS_Store
 .idea/
 .vscode/
+data/candidate_profile.json
+data/resume.txt

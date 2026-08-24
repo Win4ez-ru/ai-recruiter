@@ -1,5 +1,5 @@
 aiogram>=3.20,<4
-aiohttp>=3.12,<4
+aiohttp>=3.14.3,<4
 aiohttp-socks>=0.10,<1
 certifi>=2024.8.30
 httpx[socks]>=0.28,<1

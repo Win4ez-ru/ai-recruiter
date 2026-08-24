@@ -1,0 +1,8 @@
+Demo Candidate — Junior iOS Developer
+
+Навыки: Swift, SwiftUI, UIKit, REST API, Git, MVVM, Unit Testing.
+
+Проект: Portfolio App — iOS-приложение с сетевым слоем, локальным кешем,
+обработкой ошибок и тестами. Код и архитектурные решения доступны в портфолио.
+
+Образование: программная инженерия, выпуск в 2026 году.

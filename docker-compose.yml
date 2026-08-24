@@ -11,11 +11,14 @@ services:
       DATABASE_AUTO_CREATE: "false"
       RUN_DATABASE_MIGRATIONS: "true"
       LOG_FILE_ENABLED: "false"
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
     ports:
       - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - job_agent_data:/app/var
       - ./data:/app/data:ro

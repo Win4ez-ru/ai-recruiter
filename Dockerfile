@@ -19,7 +19,7 @@ RUN python -m pip install --upgrade pip \
 COPY alembic.ini run.py ./
 COPY migrations ./migrations
 COPY app ./app
-COPY data ./data
+COPY data/*.example.* ./data/
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN mkdir -p /app/var \

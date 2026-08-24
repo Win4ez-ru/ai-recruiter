@@ -13,3 +13,5 @@ __pycache__
 logs
 tests
 .DS_Store
+data/candidate_profile.json
+data/resume.txt

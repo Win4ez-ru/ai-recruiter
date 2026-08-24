@@ -1,14 +1,17 @@
 # AI Recruiter — персональный Telegram-бот для поиска iOS-вакансий
 
-AI Recruiter получает свежие вакансии через официальный API HeadHunter, удаляет дубликаты, дешево отсеивает нерелевантные позиции, оценивает оставшиеся вакансии через OpenAI и отправляет лучшие варианты в приватный Telegram-чат. Текущая версия рассчитана на одного пользователя, но имеет переносимый production-контур: provider-specific proxy, retry/backoff, health checks, graceful shutdown, Alembic, PostgreSQL, Docker и cross-platform CI.
+[![CI](https://github.com/Win4ez-ru/AI_recruter/actions/workflows/ci.yml/badge.svg)](https://github.com/Win4ez-ru/AI_recruter/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 
-Подробный runbook по proxy/VPN, Docker, PaaS, миграциям и честным границам масштабирования находится в [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+AI Recruiter получает свежие вакансии через официальный API HeadHunter, удаляет дубликаты, отсеивает нерелевантные позиции без затрат на LLM, объяснимо ранжирует оставшиеся и ведёт отклик до интервью и оффера в приватном Telegram-интерфейсе. AI-слой поддерживает YandexGPT, локальную Ollama и OpenAI. Проект остаётся уместным модульным монолитом для одного пользователя, но включает production-oriented контур: retry/backoff, идемпотентность, health checks, graceful shutdown, Alembic, PostgreSQL, Docker и cross-platform CI.
+
+Документы: [архитектура](docs/ARCHITECTURE.md) · [сценарий демонстрации](docs/DEMO.md) · [deployment runbook](docs/DEPLOYMENT.md).
 
 ## Коротко: как начать пользоваться
 
 1. Создайте бота через [@BotFather](https://t.me/BotFather) и сохраните токен.
 2. Узнайте свой числовой Telegram ID по инструкции ниже.
-3. Установите Python 3.11+, скопируйте `.env.example` в `.env` и заполните четыре обязательных значения.
+3. Установите Python 3.11+, скопируйте `.env.example` в `.env`, заполните Telegram-настройки и выберите YandexGPT, Ollama либо OpenAI.
 4. Установите зависимости командой `pip install -r requirements-dev.txt` для разработки или `pip install -r requirements.txt` для runtime.
 5. Запустите `python run.py`, откройте созданного бота в Telegram и отправьте `/start`.
 6. Пока нужен бот, процесс `python run.py` должен продолжать работать. Для режима 24/7 разместите его на VPS или домашнем сервере.
@@ -21,28 +24,36 @@ Telegram-бот не нужно отдельно «загружать» в Teleg
 
 > Разработал асинхронного Telegram-агента для поиска iOS-вакансий: интеграция с HeadHunter API, rule-based фильтрация, LLM-ранжирование через Structured Outputs, персональные сопроводительные письма, SQLite/SQLAlchemy, APScheduler и защита от повторной обработки.
 
-На собеседовании можно отдельно рассказать про устойчивость внешних API, дедупликацию, Pydantic-валидацию LLM-ответов, разделение на repositories/services/sources и тестирование без реальных сетевых запросов.
+На собеседовании можно отдельно рассказать про устойчивость внешних API, дедупликацию, provider-neutral AI-контракт, строгую Pydantic-валидацию, автоматическую переоценку при смене модели, атомарную финализацию отклика и восстановление незавершённых операций после сбоя.
 
 ## Возможности
 
-- семь отдельных поисковых запросов для iOS, Swift, SwiftUI и стажировок;
-- вакансии за последние 7 дней, Санкт-Петербург и удаленный формат;
+- настраиваемая search policy; по умолчанию семь запросов для iOS, Swift, SwiftUI и стажировок;
+- настраиваемые регион, глубина поиска и remote-фильтр; по умолчанию Санкт-Петербург и последние 7 дней;
 - пагинация, retry/backoff и таймауты для HH API;
 - автоматический Telegram failover между direct, HTTP и SOCKS proxy;
-- отдельные proxy и timeout-политики для Telegram, HH и OpenAI;
+- отдельные proxy и timeout-политики для Telegram, HH и каждого AI-провайдера;
 - обработка `Retry-After`, rate limit, `5xx` и transport timeout;
 - JSON-логи в stdout с редактированием секретов;
 - liveness/readiness endpoints и graceful shutdown по `SIGINT`/`SIGTERM`;
 - SQLite для локального режима, PostgreSQL/asyncpg и Alembic для deployment;
 - дедупликация по `source + external_id`;
 - предварительный фильтр без LLM;
-- структурированный LLM-анализ с оценкой 0–100 и Pydantic-валидацией;
+- структурированный LLM-анализ с оценкой 0–100 через YandexGPT, OpenAI или локальную Ollama;
+- traceability оценки: provider, модель, версия промпта и hash входных данных;
+- обновление изменившихся вакансий по TTL и переоценка при смене входов;
 - индивидуальное сопроводительное письмо;
 - подключение аккаунта HeadHunter через OAuth 2 Authorization Code + PKCE;
 - синхронизация и выбор резюме HeadHunter;
 - черновик отклика, редактирование письма и два отдельных подтверждения;
+- единый app-like интерфейс: все разделы редактируют одно активное сообщение;
+- карточная навигация по вакансиям без вертикальных дайджестов;
+- сохранение активного UI-сообщения и позиции в коллекции между перезапусками;
 - одноразовые подтверждения и защита от конкурентной обработки;
-- статусы `new`, `saved`, `applied`, `interview`, `test_task`, `rejected`, `offer`, `skipped`;
+- единый жизненный цикл вакансии: `new`, `viewed`, `saved`, `applied_manual`, `applied_bot`, `hidden`, `rejected`, `interview`, `test_task`, `offer`, `offer_accepted`, `archived`;
+- дата, источник отклика и неизменяемая история всех переходов статуса;
+- управление этапами `интервью → тестовое → оффер → принят` из Telegram;
+- безопасный `DEMO_MODE`, который проходит весь сценарий без внешней отправки;
 - SQLite и асинхронный SQLAlchemy 2;
 - ручной поиск и автоматический запуск по расписанию;
 - защита от повторного анализа и повторной отправки;
@@ -52,16 +63,16 @@ Telegram-бот не нужно отдельно «загружать» в Teleg
 
 Приложение представляет собой один асинхронный composition root с разделенными transport, repository и service слоями:
 
-1. `HHClient` делает запросы только к официальному `api.hh.ru`, объединяет выдачу по Санкт-Петербургу и удаленному формату.
+1. `HHClient` делает запросы только к официальному `api.hh.ru` и объединяет выдачу по настроенным региональному и remote-фильтрам.
 2. `VacancySearchService` дедуплицирует результаты, получает полные карточки и сохраняет новые вакансии.
 3. `VacancyFilter` исключает очевидно неподходящие позиции обычными правилами Python.
-4. `VacancyRanker` вызывает OpenAI Responses API и получает Structured Output по Pydantic-схеме.
-5. Репозитории сохраняют анализы и пользовательские статусы в SQLite.
-6. `DigestService` форматирует безопасные HTML-карточки и отмечает успешно отправленные вакансии.
-7. aiogram обрабатывает команды и inline-кнопки, APScheduler запускает тот же workflow по расписанию.
+4. `VacancyRanker` вызывает общий `AIProvider`: YandexGPT использует OpenAI-compatible Chat Completions, OpenAI — Responses API, Ollama — локальный `/api/chat`; итог всегда проверяет одна Pydantic-схема.
+5. Lifecycle-репозиторий атомарно сохраняет текущий статус, источник и запись в истории переходов.
+6. `UIManager` хранит активный экран и коллекцию карточек, редактирует одно Telegram-сообщение и восстанавливает его после рестарта.
+7. `DigestService` обновляет единую карточную коллекцию, а APScheduler запускает тот же workflow по расписанию.
 8. `HHOAuthService` проверяет одноразовый `state`, обменивает OAuth-код с PKCE и обновляет токены.
-9. `HHApplicationService` готовит черновик и атомарно обрабатывает финальное подтверждение.
-10. `FailoverTelegramSession` изолирует сетевые маршруты Telegram, а `HHClient` и OpenAI используют собственные HTTPX transports.
+9. `HHApplicationService` готовит черновик, а локальная финализация HH-результата и lifecycle вакансии происходит в одной транзакции с startup reconciliation.
+10. `FailoverTelegramSession` изолирует сетевые маршруты Telegram, а `HHClient` и AI-провайдеры используют собственные HTTPX transports.
 11. `HealthRegistry` и общий HTTP-сервер обслуживают OAuth callback, liveness и readiness.
 
 Сбой одной вакансии или внешнего API логируется и не останавливает процесс. Неоднозначные non-idempotent операции не повторяются вслепую, чтобы не создавать дубликаты или не повреждать OAuth-состояние.
@@ -70,8 +81,8 @@ Telegram-бот не нужно отдельно «загружать» в Teleg
 
 - Python 3.11 или новее;
 - Telegram-бот и его токен;
-- OpenAI API key и доступная модель со Structured Outputs;
-- интернет-доступ к `api.hh.ru`, `api.openai.com` и Telegram Bot API.
+- сервисный аккаунт Yandex Cloud с API-ключом, OpenAI API key либо установленная локальная Ollama;
+- интернет-доступ к выбранному облачному AI, `api.hh.ru` и Telegram Bot API.
 
 ## Создание Telegram-бота
 
@@ -134,24 +145,72 @@ Copy-Item .env.example .env
 ~~~env
 TELEGRAM_BOT_TOKEN=токен_от_BotFather
 TELEGRAM_USER_ID=ваш_числовой_id
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=модель_с_Structured_Outputs
+AI_PROVIDER=yandex
+YANDEX_API_KEY=ваш_api_ключ
+YANDEX_FOLDER_ID=идентификатор_каталога
+YANDEX_MODEL=yandexgpt-5.1
+YANDEX_DATA_LOGGING_ENABLED=false
 DATABASE_URL=sqlite+aiosqlite:///./job_agent.db
 DATABASE_AUTO_CREATE=true
 HH_USER_AGENT=KirillJobAgent/1.0 (your-email@example.com)
 HH_CLIENT_ID=
 HH_CLIENT_SECRET=
 HH_REDIRECT_URI=http://localhost:8080/callback
+HH_SEARCH_QUERIES=iOS Developer,iOS-разработчик,Junior iOS Developer,Swift Developer
+HH_SEARCH_AREA_ID=2
+HH_SEARCH_PERIOD_DAYS=7
+HH_SEARCH_REMOTE=true
 HTTP_HOST=127.0.0.1
 HTTP_PORT=8080
 SEARCH_INTERVAL_HOURS=12
 MIN_SCORE_TO_SEND=65
 MAX_VACANCIES_PER_DIGEST=10
+MAX_AI_ANALYSES_PER_SEARCH=25
+DEMO_MODE=false
 LOG_FORMAT=json
 LOG_FILE_ENABLED=false
 ~~~
 
-Полный список timeout, retry, proxy, health, pool и logging параметров находится в `.env.example`. `OPENAI_MODEL` должен быть доступен вашему API-проекту и поддерживать Structured Outputs. Для HH рекомендуется указывать название приложения и контактный email в User-Agent.
+Полный список timeout, retry, proxy, health, pool и logging параметров находится в `.env.example`. Ключ требуется только выбранному облачному провайдеру; для HH рекомендуется указывать название приложения и контактный email в User-Agent.
+
+## YandexGPT через грант Yandex Cloud
+
+Для долгоживущего бота используйте сервисный аккаунт с ролью `ai.languageModels.user` и создайте API-ключ через интерфейс AI Studio по актуальной инструкции Yandex. Не фиксируйте вручную один scope в IaC без сверки документации: разные страницы Yandex сейчас называют `yc.ai.languageModels.execute` и `yc.ai.foundationModels.execute`. Грант привязывается к платёжному аккаунту и автоматически уменьшает фактическую стоимость; отдельного «ключа гранта» в приложении нет.
+
+~~~env
+AI_PROVIDER=yandex
+YANDEX_API_KEY=
+YANDEX_FOLDER_ID=
+YANDEX_MODEL=yandexgpt-5.1
+YANDEX_BASE_URL=https://ai.api.cloud.yandex.net/v1
+YANDEX_TIMEOUT_SECONDS=120
+YANDEX_MAX_RETRIES=3
+YANDEX_DATA_LOGGING_ENABLED=false
+~~~
+
+Фабрика собирает URI `gpt://<folder-id>/yandexgpt-5.1`. Ранжирование идёт через Chat Completions с `response_format=json_schema`, после чего ответ повторно валидируется Pydantic. Заголовок `x-data-logging-enabled: false` включён по умолчанию, поскольку запрос содержит профиль и резюме. Официальные инструкции: [API-ключ](https://aistudio.yandex.ru/docs/ru/ai-studio/operations/get-api-key.html), [Structured Output](https://aistudio.yandex.ru/docs/ru/ai-studio/operations/generation/completions-structured.html), [отключение логирования](https://aistudio.yandex.ru/docs/ru/ai-studio/operations/disable-logging.html).
+
+## Локальная Ollama без оплаты API-токенов
+
+На MacBook Air M2 с 8 ГБ памяти рекомендуется компактная `qwen3:4b-instruct`. Установите Ollama, запустите локальный сервер и один раз загрузите модель:
+
+~~~bash
+ollama serve
+ollama pull qwen3:4b-instruct
+~~~
+
+Если приложение Ollama уже запущено в macOS, отдельный `ollama serve` не нужен. В `.env` выберите локальный провайдер:
+
+~~~env
+AI_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:4b-instruct
+OLLAMA_TIMEOUT_SECONDS=180
+OLLAMA_MAX_RETRIES=2
+OLLAMA_CONTEXT_LENGTH=16384
+~~~
+
+В этом режиме `OPENAI_API_KEY` и `OPENAI_MODEL` могут быть пустыми. Ранжирование выполняется через JSON Schema и проверяется существующей Pydantic-моделью; сопроводительные письма также генерируются локально. Для запуска приложения в Docker Compose адрес Ollama автоматически меняется на `http://host.docker.internal:11434`.
 
 ## Настройка OAuth HeadHunter
 
@@ -169,7 +228,9 @@ OAuth использует уникальный `state` со сроком жиз
 
 ## Профиль и резюме
 
-Профиль находится в `data/candidate_profile.json`, текст резюме — в `data/resume.txt`. Замените пример резюме и строку контактов на актуальные данные до генерации сопроводительных писем. JSON должен оставаться валидным и соответствовать существующей структуре.
+Обезличенные шаблоны находятся в `data/candidate_profile.example.json` и `data/resume.example.txt`. Рабочие файлы называются `data/candidate_profile.json` и `data/resume.txt`. JSON должен оставаться валидным и соответствовать существующей структуре.
+
+Production Docker image намеренно не содержит рабочие профиль и резюме: передавайте каталог `data/` read-only volume или через секретное файловое хранилище платформы. Облачный AI получает содержимое этих файлов для анализа; выбирайте провайдера и настройки хранения данных осознанно.
 
 После изменения файлов перезапустите процесс: профиль загружается при старте.
 
@@ -181,6 +242,8 @@ python run.py
 
 При локальном `DATABASE_AUTO_CREATE=true` таблицы создаются автоматически. В production сначала выполните `alembic upgrade head` и установите `DATABASE_AUTO_CREATE=false`. По умолчанию логи выводятся как JSON в stdout; файловая ротация включается отдельно.
 
+Для показа работодателю включите `DEMO_MODE=true`: поиск, AI-анализ, письмо и двойное подтверждение работают полностью, но финальный POST отклика в HH не выполняется. Готовый маршрут показа описан в [docs/DEMO.md](docs/DEMO.md).
+
 Docker Compose:
 
 ~~~bash
@@ -190,24 +253,32 @@ docker compose logs -f job-agent
 
 Подробные сценарии запуска на VPS, Railway, Render и cloud-платформах описаны в [deployment runbook](docs/DEPLOYMENT.md).
 
-## Команды Telegram
+## Интерфейс Telegram
 
-- `/start` — описание и список команд;
+Основной способ навигации — компактное inline-меню. Поиск, коллекции, карточка вакансии, профиль, статистика, OAuth и подготовка отклика сменяют друг друга внутри одного сообщения. Пользовательские команды и введенный текст письма удаляются после обработки, поэтому чат не накапливает технические сообщения.
+
+Вакансии показываются по одной с навигацией `◀ Назад · 3 / 18 · Вперёд ▶`, кратким и полным режимами, быстрым сохранением, отменяемым скрытием и переходом к отклику. Непросмотренной перестаёт считаться только реально открытая карточка, а не вся подборка. Кнопка `✅ Я уже откликнулся` позволяет подтвердить самостоятельный отклик на HH, LinkedIn, Авито или другом сервисе. После отклика этапы интервью, тестового, отказа и оффера меняются прямо из карточки.
+
+Команды остаются как быстрые deeplink-входы:
+
+- `/start` — главное меню;
 - `/help` — справка;
-- `/search` — полный ручной поиск, фильтрация, анализ и отправка дайджеста;
+- `/search` — поиск, анализ и открытие карточной коллекции;
 - `/new` — еще не отправленные вакансии с оценкой выше порога;
 - `/top` — лучшие вакансии, включая ранее показанные;
 - `/saved` — вакансии со статусом `saved`;
-- `/applied` — вакансии со статусом `applied`;
-- `/stats` — сводная статистика и наиболее частые пробелы в навыках;
-- `/profile` — краткий профиль и пути к редактируемым файлам.
+- `/applied` — самостоятельные и отправленные ботом отклики, включая последующие этапы;
+- `/stats` — воронка откликов, интервью, тестовых и офферов;
+- `/profile` — краткий профиль, используемый для AI-анализа;
 - `/hh` — состояние подключения или запуск OAuth HeadHunter.
 
-Под карточкой есть кнопка `📝 Подготовить отклик`. Бот проверяет OAuth, синхронизирует резюме, предлагает выбор, генерирует или использует сохраненное письмо и показывает полный предварительный просмотр. Если защитный шлюз HH отклоняет чтение собственных резюме с общим `403 forbidden`, бот использует `HH_DEFAULT_RESUME_ID`. Если резервный идентификатор не задан, выбор резюме переносится на официальную страницу HeadHunter. Письмо можно изменить через FSM. Первое подтверждение только создает одноразовый токен; обработка начинается после `🚀 Да, отправить`.
+Кнопка `✍️ Подготовить отклик` открывает сценарий в том же сообщении. Бот проверяет OAuth, синхронизирует резюме, предлагает выбор, генерирует или использует сохраненное письмо и показывает полный предварительный просмотр. Если защитный шлюз HH отклоняет чтение собственных резюме с общим `403 forbidden`, бот использует `HH_DEFAULT_RESUME_ID`. Если резервный идентификатор не задан, выбор резюме переносится на официальную страницу HeadHunter. Письмо можно изменить через FSM; введенное пользователем сообщение удаляется после сохранения. Первое подтверждение только создает одноразовый токен, обработка начинается после `🚀 Да, отправить`.
 
 ### Отправка через официальный API HH
 
-Для обычной вакансии после двух подтверждений бот отправляет отклик официальным методом `POST /negotiations/response` с OAuth-токеном соискателя, выбранным резюме и проверенным текстом письма. При успешном `201 Created` локальные статусы меняются на `submitted` и `applied`. Ошибка `already_applied` считается успешной синхронизацией и не вызывает повторный запрос.
+Для обычной вакансии после двух подтверждений бот отправляет отклик официальным методом `POST /negotiations/response` с OAuth-токеном соискателя, выбранным резюме и проверенным текстом письма. При успешном `201 Created` локальные статусы меняются на `submitted` и `applied_bot`. Ошибка `already_applied` считается успешной синхронизацией, сохраняется как внешний самостоятельный отклик и не вызывает повторный запрос.
+
+Текущий lifecycle хранится в одной колонке `applications.status`, без отдельных `is_saved`/`is_hidden`/`is_applied`. `application_source` фиксирует `manual` или `bot`, `applied_at` — дату отклика, а `vacancy_status_history` сохраняет каждый переход с инициатором, причиной и расширяемыми JSON-деталями. Поиск и дайджест исключают ручные и бот-отклики, скрытые, отклонённые и все последующие этапы процесса найма.
 
 Для обязательного теста, внешней формы, архивной вакансии или запрета со стороны HH используется `manual_action_required` и официальный URL. Неоднозначный timeout POST не повторяется: сервер мог принять отклик до разрыва соединения, поэтому бот просит сначала проверить сайт.
 
@@ -217,7 +288,14 @@ docker compose logs -f job-agent
 python -m pytest
 ~~~
 
-Внешние API в тестах заменены моками. Проверяются фильтрация, HH-клиент, HTML-форматирование, дедупликация, смена статуса и защита дайджеста от повторной отправки.
+Локальный regression-набор содержит 142 теста и держит coverage gate не ниже 65%. Внешние API заменены моками. Проверяются контракты OpenAI/Ollama/Yandex, приватность Yandex-запроса, HH-клиент, фильтрация, карточная навигация, сохранение непросмотренных вакансий, OAuth intent, lifecycle, атомарная финализация, crash reconciliation, миграции и безопасный demo flow.
+
+~~~bash
+pytest --cov=app --cov-report=term-missing --cov-fail-under=65
+ruff check app tests migrations scripts run.py
+ruff format --check app tests migrations scripts run.py
+python -m pip_audit --local
+~~~
 
 Дополнительно проверяются OAuth/PKCE, refresh-токены, получение резюме, официальный отклик, черновики, FSM-редактирование, два подтверждения, просроченный и чужой токен, последовательная и конкурентная идемпотентность, timeout/rate limit и ручной fallback.
 
@@ -239,11 +317,12 @@ AI_recruter/
 │   ├── schemas.py        # Pydantic-схемы
 │   └── main.py           # сборка зависимостей и lifecycle
 ├── data/
-│   ├── candidate_profile.json
-│   └── resume.txt
+│   ├── candidate_profile.example.json
+│   └── resume.example.txt
 ├── tests/
 ├── migrations/           # Alembic revisions
-├── docs/                 # deployment runbook
+├── docs/                 # architecture, demo и deployment runbook
+├── scripts/              # безопасные maintenance-команды
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
@@ -268,9 +347,9 @@ AI_recruter/
 
 Для OAuth-методов бот нормализует истекшую или отозванную авторизацию, недоступное резюме, rate limit и временные ошибки без показа сырого JSON, HTML или traceback. CAPTCHA не обходится; используется официальный ручной путь, когда он доступен.
 
-### OpenAI недоступен
+### AI-модель недоступна
 
-Проверьте ключ, модель, баланс и доступ проекта. OpenAI имеет отдельные timeout/retry/proxy настройки. Provider-level сбой останавливает дальнейшие LLM-вызовы текущего поиска, но не завершает процесс; необработанные вакансии будут рассмотрены позднее.
+Проверьте выбранный `AI_PROVIDER`, ключ/модель облачного провайдера либо статус `ollama serve`. Каждый провайдер имеет отдельные timeout/retry/proxy настройки. Provider-level сбой останавливает дальнейшие AI-вызовы текущего поиска, но не завершает процесс; необработанные вакансии будут рассмотрены позднее.
 
 ### Telegram не принимает сообщение
 
@@ -289,9 +368,8 @@ AI_recruter/
 - только официальный HeadHunter API;
 - токены OAuth хранятся в базе без application-level шифрования;
 - вакансии с обязательным тестом или внешней формой требуют ручного завершения;
-- качество ранжирования и писем зависит от выбранной OpenAI-модели;
+- качество и скорость ранжирования и писем зависят от выбранной YandexGPT/OpenAI/Ollama-модели и локального оборудования;
 - простой rule-based фильтр может давать пограничные ложные срабатывания;
-- статистика статусов `interview`, `test_task`, `rejected` и `offer` хранится в модели, но текущий UI не содержит отдельных Telegram-кнопок для всех этих переходов;
 - нет веб-интерфейса, многопользовательского режима и горизонтального масштабирования;
 - scheduler, search lock и polling живут в одном процессе;
 - OAuth-токены еще не зашифрованы application-level ключом.
@@ -323,4 +401,6 @@ AI_recruter/
 7. Нажмите `🚀 Да, отправить`: для обычной вакансии должен появиться результат успешной отправки через HH.
 8. Повторите финальное нажатие: новый запрос в HH не должен выполняться.
 9. Проверьте вакансию с тестом или внешней формой: бот должен показать специальное сообщение и официальный URL.
-10. Проверьте базу: успешный отклик имеет `hh_applications.api_status=submitted`, а статус вакансии равен `applied`.
+10. Проверьте базу: успешный отклик имеет `hh_applications.api_status=submitted`, а статус вакансии равен `applied_bot`.
+11. На другой карточке нажмите `✅ Я уже откликнулся`, отмените подтверждение и убедитесь, что статус не изменился.
+12. Повторите и подтвердите: статус должен стать `applied_manual`, `application_source=manual`, а вакансия должна исчезнуть из поиска и текущей подборки.

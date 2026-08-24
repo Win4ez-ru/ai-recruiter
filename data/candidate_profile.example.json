@@ -1,0 +1,45 @@
+{
+  "candidate_name": "Demo Candidate",
+  "target_roles": [
+    "Junior iOS Developer",
+    "iOS Developer"
+  ],
+  "location": "Санкт-Петербург",
+  "remote_allowed": true,
+  "relocation_allowed": false,
+  "minimum_salary_rub": 90000,
+  "preferred_salary_rub": 130000,
+  "education": {
+    "university": "Технический университет",
+    "program": "Программная инженерия",
+    "graduation_year": 2026
+  },
+  "experience": {
+    "commercial_ios_experience": false,
+    "personal_projects": true,
+    "team_experience": true
+  },
+  "strong_skills": [
+    "Swift",
+    "SwiftUI",
+    "UIKit",
+    "Git",
+    "REST API"
+  ],
+  "basic_skills": [
+    "Combine",
+    "Core Data",
+    "Unit Testing"
+  ],
+  "projects": [
+    {
+      "name": "Portfolio App",
+      "description": "iOS-приложение с API, офлайн-кешем и тестами"
+    }
+  ],
+  "hard_rejections": [
+    "обязательный опыт 4+ года",
+    "только Objective-C",
+    "обязательная релокация"
+  ]
+}

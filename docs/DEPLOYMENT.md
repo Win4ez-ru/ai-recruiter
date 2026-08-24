@@ -65,9 +65,9 @@ webhook). `sendMessage` после неоднозначного сетевого
 host VPN зависит от конкретного VPN-клиента; явный proxy обычно
 предсказуемее.
 
-## HeadHunter и OpenAI
+## HeadHunter и AI-провайдеры
 
-HH и OpenAI не наследуют общие proxy-переменные по умолчанию. Это защищает от
+HH и AI-провайдеры не наследуют общие proxy-переменные по умолчанию. Это защищает от
 ситуации, когда Telegram требует VPN, а HH отклоняет VPN-адрес.
 
 ```env
@@ -76,6 +76,8 @@ HH_TRUST_ENV=false
 HH_DEFAULT_RESUME_ID=
 OPENAI_PROXY_URL=
 OPENAI_TRUST_ENV=false
+YANDEX_PROXY_URL=
+YANDEX_TRUST_ENV=false
 ```
 
 Чтобы использовать `HTTP_PROXY`, `HTTPS_PROXY` или `ALL_PROXY` для конкретного
@@ -111,9 +113,46 @@ POST отклика не повторяется после read/write timeout: �
 список откликов перед новой попыткой. `already_applied` нормализуется как успешно
 синхронизированный результат.
 
-OpenAI использует отдельный HTTPX transport, ограниченный timeout и retry
-официального SDK. Пользователю показывается безопасная категория ошибки без
-токена, сырого ответа или traceback.
+OpenAI и YandexGPT используют отдельные HTTPX transports и ограниченные
+timeout/retry. Пользователю показывается общая безопасная категория AI-ошибки
+без токена, сырого ответа или traceback.
+
+Рекомендуемая конфигурация Yandex AI Studio:
+
+```env
+AI_PROVIDER=yandex
+YANDEX_API_KEY=
+YANDEX_FOLDER_ID=
+YANDEX_MODEL=yandexgpt-5.1
+YANDEX_BASE_URL=https://ai.api.cloud.yandex.net/v1
+YANDEX_DATA_LOGGING_ENABLED=false
+```
+
+Для долгоживущего процесса используйте сервисный аккаунт с ролью
+`ai.languageModels.user` и создайте API-ключ через интерфейс AI Studio по
+актуальной инструкции. При ручной автоматизации сверяйте требуемый scope:
+разные страницы Yandex сейчас называют `yc.ai.languageModels.execute` и
+`yc.ai.foundationModels.execute`. IAM token с коротким сроком жизни без
+автоматического refresh не подходит. `x-data-logging-enabled: false` включён
+по умолчанию, поскольку запрос содержит профиль и резюме.
+
+Локальный режим не требует OpenAI API key:
+
+```env
+AI_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:4b-instruct
+OLLAMA_TIMEOUT_SECONDS=180
+OLLAMA_MAX_RETRIES=2
+OLLAMA_CONTEXT_LENGTH=16384
+```
+
+Ollama вызывается через нативный `/api/chat`. Для ранжирования приложение
+передает JSON Schema и повторно валидирует результат через Pydantic. При запуске
+бота внутри Docker Compose используется `http://host.docker.internal:11434`,
+поскольку `127.0.0.1` контейнера не является хостом macOS. Ollama должна быть
+запущена на хосте до старта бота, а модель заранее загружена командой
+`ollama pull qwen3:4b-instruct`.
 
 ## Health checks
 
@@ -141,7 +180,7 @@ PaaS-переменная `PORT` имеет приоритет над `HTTP_PORT
 
 ## Локальный Docker Compose
 
-1. Заполните `.env` и профиль в `data/`.
+1. Заполните `.env` и рабочие профиль/резюме в `data/`.
 2. Соберите и запустите сервис:
 
 ```bash
@@ -158,6 +197,10 @@ docker compose down
 SQLite хранится в named volume `job_agent_data`, а не внутри disposable-слоя
 контейнера. Compose запускает ровно один polling-экземпляр и передает `SIGTERM`
 через init-процесс.
+
+Рабочие `data/candidate_profile.json` и `data/resume.txt` исключены из Docker
+build context и не попадают в image layers. Compose монтирует локальный `data/`
+read-only; на PaaS используйте secret files или отдельный read-only volume.
 
 ## База данных и миграции
 
@@ -193,19 +236,29 @@ DATABASE_URL=postgresql+asyncpg://user:password@db.example:5432/job_agent
 Значения `postgres://...` и `postgresql://...` автоматически нормализуются к
 asyncpg. Пароль БД считается секретом и не появляется в `repr(Settings)`.
 
-Если существующая SQLite-база раньше создавалась через `create_all`, сначала
-сделайте резервную копию. Затем убедитесь, что модели совпадают со схемой:
+Если существующая база раньше создавалась через `create_all` и не содержит
+`alembic_version`, сначала сделайте резервную копию. Нельзя вслепую делать
+`stamp initial`: более поздние миграции попытаются повторно создать уже
+существующие таблицы.
+
+Сначала выполните read-only сравнение реальной схемы со всеми текущими
+SQLAlchemy-моделями:
 
 ```bash
+python -m scripts.adopt_legacy_database
+```
+
+Только при точном совпадении команда предложит безопасно принять текущую head
+revision:
+
+```bash
+python -m scripts.adopt_legacy_database --stamp
 alembic check
 ```
 
-Только при результате `No new upgrade operations detected` можно принять
-начальную миграцию без повторного создания таблиц:
-
-```bash
-alembic stamp 79d69bcda3e6
-```
+Если найдены отличия, stamp запрещён: перенесите данные в новую базу или
+подготовьте отдельную data migration. Скрипт никогда не меняет схему и без
+явного `--stamp` работает read-only.
 
 ## VPS, Railway, Render и облака
 
@@ -251,15 +304,15 @@ LOG_FILE_ENABLED=false
 ротационный файл можно включить через `LOG_FILE_ENABLED=true` и
 `LOG_FILE_PATH=logs/job-agent.log`.
 
-Formatter маскирует Telegram/OpenAI-токены, Bearer credentials, чувствительные
+Formatter маскирует Telegram/AI-токены, Bearer credentials, чувствительные
 structured fields и пароль в proxy URL. Это дополнительная защита, а не замена
 правильному хранению секретов. При подозрении на утечку ключ необходимо
 отозвать и заменить.
 
 ## Границы текущей версии
 
-Текущий продукт production-hardened как персональный однопользовательский
-процесс, но еще не является multi-tenant SaaS для тысяч независимых клиентов:
+Текущий продукт production-oriented как персональный однопользовательский
+процесс, но ещё не является multi-tenant SaaS для независимых клиентов:
 
 - доступ разрешен одному `TELEGRAM_USER_ID`;
 - часть доменных таблиц не содержит tenant key;

@@ -51,10 +51,12 @@ jobs:
           python -m pip check
 
       - name: Compile sources
-        run: python -m compileall -q app tests
+        run: python -m compileall -q app tests migrations scripts
 
       - name: Run static checks
-        run: python -m ruff check app tests migrations run.py
+        run: |
+          python -m ruff check app tests migrations scripts run.py
+          python -m ruff format --check app tests migrations scripts run.py
 
       - name: Run tests
         run: python -m pytest -q
@@ -65,11 +67,87 @@ jobs:
         run: |
           python -m alembic upgrade head
           python -m alembic check
+          python -m alembic downgrade 5e7b34c9a2d1
+          python -m alembic upgrade head
+          python -m alembic check
+
+  quality:
+    name: Coverage and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade "pip>=26.2" "setuptools>=83"
+          python -m pip install --requirement requirements-dev.txt
+
+      - name: Enforce test coverage
+        run: python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=65
+
+      - name: Audit Python dependencies
+        run: python -m pip_audit --local --cache-dir /tmp/pip-audit-cache
+
+  postgres-migrations:
+    name: PostgreSQL migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: job_agent
+          POSTGRES_USER: job_agent
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U job_agent -d job_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://job_agent:test-password@127.0.0.1:5432/job_agent
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Upgrade and verify schema
+        run: |
+          python -m alembic upgrade head
+          python -m alembic check
+          python -m alembic downgrade 5e7b34c9a2d1
+          python -m alembic upgrade head
+          python -m alembic check
 
   docker:
     name: Build production image
     runs-on: ubuntu-latest
-    needs: test
+    needs:
+      - test
+      - quality
+      - postgres-migrations
     timeout-minutes: 15
     steps:
       - name: Check out repository
