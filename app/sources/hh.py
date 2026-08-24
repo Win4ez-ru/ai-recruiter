@@ -110,6 +110,9 @@ class HHClient(VacancySource):
         retry_policy: RetryPolicy | None = None,
         proxy_url: str | None = None,
         trust_env: bool = False,
+        search_area_id: str = SPB_AREA_ID,
+        search_period_days: int = 7,
+        search_remote: bool = True,
         http_client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -124,6 +127,9 @@ class HHClient(VacancySource):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
+        self.search_area_id = search_area_id.strip()
+        self.search_period_days = search_period_days
+        self.search_remote = search_remote
         self._application_access_token: str | None = None
         self._application_token_lock = asyncio.Lock()
         self._owns_client = http_client is None
@@ -348,9 +354,7 @@ class HHClient(VacancySource):
 
     async def _token_request(self, data: dict[str, str]) -> dict[str, Any]:
         try:
-            response = await self._send(
-                "POST", "/token", data=data, idempotent=False
-            )
+            response = await self._send("POST", "/token", data=data, idempotent=False)
         except HHTransportError as exc:
             raise HHAuthorizationError("HH token request failed") from exc
         if response.status_code >= 400:
@@ -436,9 +440,7 @@ class HHClient(VacancySource):
             raise HHAPIError(f"Unexpected HH response for {path}")
         return payload
 
-    async def _authorized_get(
-        self, path: str, access_token: str
-    ) -> dict[str, Any]:
+    async def _authorized_get(self, path: str, access_token: str) -> dict[str, Any]:
         response = await self._send(
             "GET",
             path,
@@ -550,7 +552,7 @@ class HHClient(VacancySource):
             per_page = min(100, max_results - len(results))
             params: dict[str, Any] = {
                 "text": query,
-                "period": 7,
+                "period": self.search_period_days,
                 "order_by": "publication_time",
                 "page": page,
                 "per_page": per_page,
@@ -572,15 +574,22 @@ class HHClient(VacancySource):
         self, query: str, *, max_results: int = 100
     ) -> list[dict[str, Any]]:
         logger.info("Searching HH vacancies for query %r", query)
-        local, remote = await asyncio.gather(
-            self._search_scope(query, max_results, {"area": SPB_AREA_ID}),
-            self._search_scope(query, max_results, {"schedule": "remote"}),
+        scopes: list[dict[str, Any]] = []
+        if self.search_area_id:
+            scopes.append({"area": self.search_area_id})
+        if self.search_remote:
+            scopes.append({"schedule": "remote"})
+        if not scopes:
+            scopes.append({})
+        scoped_results = await asyncio.gather(
+            *(self._search_scope(query, max_results, scope) for scope in scopes)
         )
         unique: dict[str, dict[str, Any]] = {}
-        for item in [*local, *remote]:
-            external_id = str(item.get("id") or "")
-            if external_id:
-                unique[external_id] = item
+        for items in scoped_results:
+            for item in items:
+                external_id = str(item.get("id") or "")
+                if external_id:
+                    unique[external_id] = item
         ordered = sorted(
             unique.values(),
             key=lambda item: item.get("published_at") or "",
@@ -630,9 +639,7 @@ def vacancy_from_hh(
     return VacancyCreate(
         source="hh",
         external_id=str(details.get("id") or search_item.get("id") or ""),
-        title=str(
-            details.get("name") or search_item.get("name") or "Без названия"
-        ),
+        title=str(details.get("name") or search_item.get("name") or "Без названия"),
         company=_name(
             details.get("employer") or search_item.get("employer"), "Не указана"
         ),
@@ -650,9 +657,7 @@ def vacancy_from_hh(
         salary_to=int(salary["to"]) if salary.get("to") is not None else None,
         salary_currency=salary.get("currency"),
         salary_gross=salary.get("gross"),
-        location=_name(
-            details.get("area") or search_item.get("area"), "Не указана"
-        ),
+        location=_name(details.get("area") or search_item.get("area"), "Не указана"),
         work_format=work_format,
         experience=_name(
             details.get("experience") or search_item.get("experience"), "Не указан"

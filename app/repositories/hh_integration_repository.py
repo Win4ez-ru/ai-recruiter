@@ -178,7 +178,9 @@ class HHIntegrationRepository:
                     await session.scalars(
                         select(HHResume)
                         .where(HHResume.telegram_user_id == telegram_user_id)
-                        .order_by(HHResume.is_default.desc(), HHResume.updated_at.desc())
+                        .order_by(
+                            HHResume.is_default.desc(), HHResume.updated_at.desc()
+                        )
                     )
                 ).all()
             )

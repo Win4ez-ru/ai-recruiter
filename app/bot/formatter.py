@@ -11,6 +11,19 @@ DECISION_LABELS = {
     "skip": "лучше пропустить",
 }
 CURRENCY_SYMBOLS = {"RUR": "₽", "RUB": "₽", "USD": "$", "EUR": "€"}
+STATUS_LABELS = {
+    "viewed": "👁 Просмотрена",
+    "saved": "❤️ В избранном",
+    "applied_manual": "✅ Вы откликнулись самостоятельно",
+    "applied_bot": "✅ Отклик отправлен через бота",
+    "interview": "🤝 Интервью",
+    "test_task": "🧪 Тестовое задание",
+    "rejected": "⛔ Отказ",
+    "offer": "🎉 Оффер",
+    "offer_accepted": "🏁 Оффер принят",
+    "hidden": "🙈 Скрыта",
+    "archived": "🗄 В архиве",
+}
 
 
 def _safe(value: object, limit: int = 500) -> str:
@@ -52,29 +65,97 @@ def _list_section(title: str, values: list[str], *, max_items: int = 6) -> str:
     return f"<b>{title}:</b>\n{items}"
 
 
-def format_vacancy_card(vacancy: Vacancy) -> str:
+def _score_bar(score: int) -> str:
+    filled = max(0, min(10, round(score / 10)))
+    return "●" * filled + "○" * (10 - filled)
+
+
+def _summary(vacancy: Vacancy, limit: int) -> str:
+    text = vacancy.description or vacancy.requirements or vacancy.responsibilities
+    if not text:
+        return "Описание появится на странице вакансии."
+    return _safe(text, limit)
+
+
+def _stack(vacancy: Vacancy) -> str:
+    skills = vacancy.key_skills
+    if not skills and vacancy.analysis is not None:
+        skills = vacancy.analysis.matched_skills
+    if not skills:
+        return "не указан"
+    visible = " · ".join(skills[:8])
+    if len(skills) > 8:
+        visible += " · …"
+    return visible
+
+
+def _published(vacancy: Vacancy) -> str:
+    if vacancy.published_at is None:
+        return "не указана"
+    return vacancy.published_at.strftime("%d.%m.%Y")
+
+
+def format_vacancy_card(
+    vacancy: Vacancy,
+    *,
+    position: int = 1,
+    total: int = 1,
+    collection_title: str = "Вакансия",
+    expanded: bool = False,
+) -> str:
     analysis = vacancy.analysis
     if analysis is None:
         return f"<b>{_safe(vacancy.title)} — {_safe(vacancy.company)}</b>"
+    status = vacancy.application.status if vacancy.application else "new"
+    status_line = STATUS_LABELS.get(status)
+    header = (
+        f"<b>💼 {_safe(collection_title, 120)}</b>\n<code>{position} / {total}</code>"
+    )
+    identity = f"<b>{_safe(vacancy.title, 420)}</b>\n🏢 {_safe(vacancy.company, 300)}"
+    facts = (
+        f"💰 <b>Зарплата:</b> {_safe(format_salary(vacancy))}\n"
+        f"📍 <b>Город:</b> {_safe(vacancy.location)}\n"
+        f"🧭 <b>Формат:</b> {_safe(vacancy.work_format)}\n"
+        f"🧑‍💻 <b>Опыт:</b> {_safe(vacancy.experience)}\n"
+        f"🧩 <b>Стек:</b> {_safe(_stack(vacancy), 650)}"
+    )
+    score = (
+        f"<b>✨ Совпадение — {analysis.match_score}%</b>\n"
+        f"<code>{_score_bar(analysis.match_score)}</code>\n"
+        f"{_safe(DECISION_LABELS.get(analysis.decision, analysis.decision), 180)}"
+    )
     blocks = [
-        f"<b>{_safe(vacancy.title)} — {_safe(vacancy.company)}</b>",
-        (
-            f"<b>Оценка:</b> {analysis.match_score}/100\n"
-            f"<b>Решение:</b> {_safe(DECISION_LABELS.get(analysis.decision, analysis.decision))}"
-        ),
-        (
-            f"<b>Зарплата:</b> {_safe(format_salary(vacancy))}\n"
-            f"<b>Формат:</b> {_safe(vacancy.work_format)}\n"
-            f"<b>Город:</b> {_safe(vacancy.location)}\n"
-            f"<b>Опыт:</b> {_safe(vacancy.experience)}"
-        ),
-        _list_section("Совпало", analysis.matched_skills),
-        _list_section("Не хватает", analysis.missing_skills),
-        _list_section("Преимущества", analysis.advantages),
-        _list_section("Риски", analysis.risks),
-        _list_section("На чем сделать акцент", analysis.resume_focus),
-        f"<b>Почему стоит откликнуться:</b>\n{_safe(analysis.reason, 800)}",
+        header,
+        identity,
+        status_line or "",
+        facts,
+        score,
+        f"<b>Коротко</b>\n{_summary(vacancy, 620 if not expanded else 1_350)}",
+        f"<b>🤖 Мнение AI</b>\n{_safe(analysis.reason, 720)}",
     ]
+    if expanded:
+        blocks.extend(
+            [
+                (
+                    "<b>Детали вакансии:</b>\n"
+                    f"• Уровень: {_safe(analysis.role_level, 80)}\n"
+                    f"• Занятость: {_safe(vacancy.employment, 160)}\n"
+                    f"• Опубликована: {_safe(_published(vacancy), 40)}"
+                ),
+                _list_section("✅ Совпало", analysis.matched_skills, max_items=8),
+                _list_section(
+                    "🚧 Обязательные блокеры",
+                    analysis.blocking_requirements,
+                    max_items=5,
+                ),
+                _list_section(
+                    "📚 Стоит подтянуть", analysis.missing_skills, max_items=6
+                ),
+                _list_section("💪 Преимущества", analysis.advantages, max_items=5),
+                _list_section("⚠️ Риски", analysis.risks, max_items=5),
+                _list_section("🎯 Акцент в резюме", analysis.resume_focus, max_items=5),
+            ]
+        )
     selected: list[str] = []
     for block in (block for block in blocks if block):
         candidate = "\n\n".join([*selected, block])

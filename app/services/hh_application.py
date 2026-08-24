@@ -9,9 +9,9 @@ from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import ApplicationResult, HHResumeData, PreparedApplication
+from app.services.ai_errors import AIServiceError
 from app.services.cover_letter import CoverLetterService
 from app.services.hh_oauth import HHOAuthService
-from app.services.openai_errors import OpenAIServiceError
 from app.sources.hh import (
     HHAPIError,
     HHAuthorizationError,
@@ -19,6 +19,7 @@ from app.sources.hh import (
     HHRemoteError,
     HHTransportError,
 )
+from app.vacancy_status import has_registered_application
 
 logger = logging.getLogger(__name__)
 MANUAL_RESUME_EXTERNAL_ID = "__select_on_hh__"
@@ -30,7 +31,7 @@ APPLICATION_ERROR_MESSAGES = {
     ),
     "resume_not_found": (
         "resume_not_found",
-        "Резюме больше недоступно. Выбери его на HeadHunter.",
+        "Резюме больше недоступно. Выберите его на HeadHunter.",
     ),
     "resume_visibility_conflict": (
         "resume_visibility_conflict",
@@ -44,11 +45,15 @@ APPLICATION_ERROR_MESSAGES = {
 
 
 class HHApplicationError(RuntimeError):
-    user_message = "Не удалось подготовить отклик. Попробуй позже."
+    user_message = "Не удалось подготовить отклик. Попробуйте позже."
 
 
 class HHNotAuthorizedError(HHApplicationError):
-    user_message = "Подключи аккаунт HeadHunter, чтобы продолжить."
+    user_message = "Подключите аккаунт HeadHunter, чтобы продолжить."
+
+
+class HHAlreadyAppliedError(HHApplicationError):
+    user_message = "Отклик на эту вакансию уже зарегистрирован."
 
 
 class HHNoResumesError(HHApplicationError):
@@ -56,11 +61,11 @@ class HHNoResumesError(HHApplicationError):
 
 
 class HHResumeUnavailableError(HHApplicationError):
-    user_message = "Резюме больше недоступно. Выбери другое."
+    user_message = "Резюме больше недоступно. Выберите другое."
 
 
 class HHResumeSelectionRequired(HHApplicationError):
-    user_message = "Выбери резюме для отклика."
+    user_message = "Выберите резюме для отклика."
 
     def __init__(self, resumes: list[HHResumeData]) -> None:
         super().__init__(self.user_message)
@@ -74,11 +79,11 @@ class HHConfirmationError(HHApplicationError):
 
 
 class HHRateLimitError(HHApplicationError):
-    user_message = "HeadHunter временно ограничил число запросов. Попробуй позже."
+    user_message = "HeadHunter временно ограничил число запросов. Попробуйте позже."
 
 
 class HHTemporaryApplicationError(HHApplicationError):
-    user_message = "HeadHunter временно недоступен. Попробуй позже."
+    user_message = "HeadHunter временно недоступен. Попробуйте позже."
 
 
 class HHResumeAccessForbiddenError(HHApplicationError):
@@ -86,7 +91,7 @@ class HHResumeAccessForbiddenError(HHApplicationError):
 
 
 class HHCoverLetterUnavailableError(HHApplicationError):
-    user_message = "Не удалось создать письмо: OpenAI временно недоступен."
+    user_message = "Не удалось создать письмо: AI-модель временно недоступна."
 
 
 @dataclass(slots=True)
@@ -132,16 +137,16 @@ def _application_error_details(exc: HHRemoteError) -> tuple[str, str]:
     if exc.status_code == 429:
         return (
             "rate_limit",
-            "HeadHunter временно ограничил число запросов. Попробуй позже.",
+            "HeadHunter временно ограничил число запросов. Попробуйте позже.",
         )
     if exc.status_code >= 500:
         return (
             "temporary_hh_error",
-            "HeadHunter временно недоступен. Попробуй позже.",
+            "HeadHunter временно недоступен. Попробуйте позже.",
         )
     return (
         "application_denied",
-        "HeadHunter не разрешил автоматический отклик. Заверши его на сайте.",
+        "HeadHunter не разрешил автоматический отклик. Завершите его на сайте.",
     )
 
 
@@ -164,6 +169,7 @@ class HHApplicationService:
         cover_letter_service: CoverLetterService,
         confirmation_ttl_seconds: int,
         default_resume_id: str = "",
+        demo_mode: bool = False,
     ) -> None:
         self.hh_client = hh_client
         self.oauth_service = oauth_service
@@ -174,6 +180,7 @@ class HHApplicationService:
         self.cover_letter_service = cover_letter_service
         self.confirmation_ttl_seconds = confirmation_ttl_seconds
         self.default_resume_id = default_resume_id.strip()
+        self.demo_mode = demo_mode
 
     async def _token(self, user_id: int) -> str:
         try:
@@ -218,6 +225,10 @@ class HHApplicationService:
         vacancy = await self.vacancy_repository.get_by_id(vacancy_id)
         if vacancy is None or vacancy.source != "hh":
             raise HHApplicationError("Vacancy is unavailable")
+        if vacancy.application is not None and has_registered_application(
+            vacancy.application.status
+        ):
+            raise HHAlreadyAppliedError
         token = await self._token(user_id)
         try:
             resumes = await self._sync_resumes(user_id, token)
@@ -275,7 +286,7 @@ class HHApplicationService:
         if not cover_letter:
             try:
                 cover_letter = await self.cover_letter_service.generate(vacancy)
-            except OpenAIServiceError as exc:
+            except AIServiceError as exc:
                 raise HHCoverLetterUnavailableError from exc
         if not cover_letter:
             raise HHApplicationError("Cover letter generation failed")
@@ -295,6 +306,9 @@ class HHApplicationService:
             resume=selected_data,
             resumes=available_resumes,
             cover_letter=draft.cover_letter,
+            manual_submission_required=(
+                selected_data.external_id == MANUAL_RESUME_EXTERNAL_ID
+            ),
         )
 
     async def get_preview(
@@ -319,10 +333,7 @@ class HHApplicationService:
                 ),
                 None,
             )
-            if (
-                selected is None
-                and draft.resume_external_id == self.default_resume_id
-            ):
+            if selected is None and draft.resume_external_id == self.default_resume_id:
                 selected_data = _configured_resume_data(self.default_resume_id)
                 available_resumes = []
             elif selected is None:
@@ -339,6 +350,9 @@ class HHApplicationService:
             resume=selected_data,
             resumes=available_resumes,
             cover_letter=draft.cover_letter,
+            manual_submission_required=(
+                draft.resume_external_id == MANUAL_RESUME_EXTERNAL_ID
+            ),
         )
 
     async def update_cover_letter(
@@ -379,7 +393,7 @@ class HHApplicationService:
         message: str,
         manual_url: str | None,
     ) -> ApplicationResult:
-        await self.application_repository.mark_manual_action(
+        application = await self.application_repository.mark_manual_action(
             application_id,
             code=code,
             message=message,
@@ -387,6 +401,7 @@ class HHApplicationService:
         return ApplicationResult(
             status="manual_action_required",
             message=message,
+            vacancy_id=application.vacancy_id,
             manual_url=manual_url,
         )
 
@@ -396,24 +411,17 @@ class HHApplicationService:
         *,
         external_id: str | None,
         message: str,
+        submitted_through_bot: bool = True,
     ) -> ApplicationResult:
-        await self.application_repository.mark_submitted(
+        await self.application_repository.finalize_submitted(
             application.id,
             external_id=external_id,
+            submitted_through_bot=submitted_through_bot,
         )
-        try:
-            await self.status_repository.set_status(application.vacancy_id, "applied")
-        except Exception:
-            logger.exception(
-                "Could not synchronize local applied status",
-                extra={
-                    "event": "hh_application_status_sync_failed",
-                    "application_id": application.id,
-                },
-            )
         return ApplicationResult(
             status="submitted",
             message=message,
+            vacancy_id=application.vacancy_id,
             external_id=external_id,
         )
 
@@ -426,14 +434,22 @@ class HHApplicationService:
         messages = {
             "invalid": "Подтверждение недействительно.",
             "forbidden": "Нельзя подтвердить чужой отклик.",
-            "expired": "Подтверждение устарело. Подготовь отклик заново.",
+            "expired": "Подтверждение устарело. Подготовьте отклик заново.",
             "used": "Это подтверждение уже использовано.",
             "submitting": "Отклик уже обрабатывается.",
             "submitted": "Отклик уже был отправлен.",
         }
         if lease.outcome != "acquired" or lease.application is None:
             status = "submitted" if lease.outcome == "submitted" else "failed"
-            return ApplicationResult(status=status, message=messages[lease.outcome])
+            return ApplicationResult(
+                status=status,
+                message=messages[lease.outcome],
+                vacancy_id=(
+                    lease.application.vacancy_id
+                    if lease.application is not None
+                    else None
+                ),
+            )
         application = lease.application
         vacancy = await self.vacancy_repository.get_by_id(application.vacancy_id)
         if vacancy is None:
@@ -468,14 +484,13 @@ class HHApplicationService:
                 manual_url=manual_url,
             )
         if details.get("has_test") or (
-            isinstance(details.get("test"), dict)
-            and details["test"].get("required")
+            isinstance(details.get("test"), dict) and details["test"].get("required")
         ):
             return await self._manual_result(
                 application.id,
                 code="test_required",
                 message=(
-                    "Работодатель требует пройти тест. Заверши отклик на сайте "
+                    "Работодатель требует пройти тест. Завершите отклик на сайте "
                     "HeadHunter."
                 ),
                 manual_url=manual_url,
@@ -484,7 +499,24 @@ class HHApplicationService:
             return await self._manual_result(
                 application.id,
                 code="resume_selection_required",
-                message="Открой вакансию и выбери резюме на HeadHunter.",
+                message="Откройте вакансию и выберите резюме на HeadHunter.",
+                manual_url=manual_url,
+            )
+
+        if self.demo_mode:
+            await self.application_repository.mark_manual_action(
+                application.id,
+                code="demo_mode",
+                message="Демо-режим: внешний отклик намеренно не отправлен.",
+            )
+            return ApplicationResult(
+                status="demo",
+                message=(
+                    "Письмо и подтверждение прошли полный сценарий. "
+                    "Внешний отклик не отправлен — DEMO_MODE защищает от "
+                    "случайного действия."
+                ),
+                vacancy_id=application.vacancy_id,
                 manual_url=manual_url,
             )
 
@@ -500,11 +532,14 @@ class HHApplicationService:
             return await self._manual_result(
                 application.id,
                 code="authorization_expired",
-                message="Авторизация HeadHunter истекла. Подключи аккаунт заново.",
+                message="Авторизация HeadHunter истекла. Подключите аккаунт заново.",
                 manual_url=manual_url,
             )
         except HHRemoteError as exc:
-            if exc.error_type == "negotiations" and exc.error_value == "already_applied":
+            if (
+                exc.error_type == "negotiations"
+                and exc.error_value == "already_applied"
+            ):
                 return await self._submitted_result(
                     application,
                     external_id=None,
@@ -512,6 +547,7 @@ class HHApplicationService:
                         "Отклик уже существует на HeadHunter. Локальный статус "
                         "синхронизирован."
                     ),
+                    submitted_through_bot=False,
                 )
             code, message = _application_error_details(exc)
             return await self._manual_result(
@@ -525,7 +561,7 @@ class HHApplicationService:
                 application.id,
                 code="submission_result_unknown",
                 message=(
-                    "Соединение оборвалось во время отправки. Проверь отклики на "
+                    "Соединение оборвалось во время отправки. Проверьте отклики на "
                     "HeadHunter перед повторной попыткой."
                 ),
                 manual_url=manual_url,
@@ -534,7 +570,7 @@ class HHApplicationService:
             return await self._manual_result(
                 application.id,
                 code="hh_request_failed",
-                message="Не удалось подтвердить отправку. Проверь отклики на HeadHunter.",
+                message="Не удалось подтвердить отправку. Проверьте отклики на HeadHunter.",
                 manual_url=manual_url,
             )
 

@@ -45,7 +45,9 @@ class VacancyFilter:
         reasons: list[str] = []
 
         ios_context = bool(re.search(r"\bios\b|\bswift(?:ui)?\b|\buikit\b", full_text))
-        if re.search(r"\bsenior\b|\bsr\.?\s+(?:ios|developer)|\blead\b|team\s*lead", title):
+        if re.search(
+            r"\bsenior\b|\bsr\.?\s+(?:ios|developer)|\blead\b|team\s*lead", title
+        ):
             negatives.append("Senior/Lead")
             reasons.append("Уровень Senior или Lead указан в названии вакансии")
         if re.search(r"руководител\w*|начальник\w*|head\s+of", title):

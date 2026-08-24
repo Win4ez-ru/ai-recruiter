@@ -137,7 +137,9 @@ async def test_expired_access_token_is_refreshed_once(database: Database) -> Non
 
 
 @pytest.mark.asyncio
-async def test_concurrent_token_reads_use_refresh_token_once(database: Database) -> None:
+async def test_concurrent_token_reads_use_refresh_token_once(
+    database: Database,
+) -> None:
     repository = HHIntegrationRepository(database)
     client = FakeOAuthClient()
     service = HHOAuthService(client, repository, settings())  # type: ignore[arg-type]

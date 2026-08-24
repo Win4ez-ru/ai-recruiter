@@ -7,13 +7,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ApplicationStatus = Literal[
     "new",
+    "viewed",
     "saved",
-    "applied",
+    "applied_manual",
+    "applied_bot",
+    "hidden",
     "interview",
     "test_task",
     "rejected",
     "offer",
-    "skipped",
+    "offer_accepted",
+    "archived",
 ]
 Decision = Literal["strong_apply", "apply", "maybe", "skip"]
 RoleLevel = Literal[
@@ -24,9 +28,9 @@ SearchErrorCode = Literal[
     "hh_forbidden",
     "hh_rate_limited",
     "hh_unavailable",
-    "openai_rate_limited",
-    "openai_unavailable",
-    "openai_configuration",
+    "ai_rate_limited",
+    "ai_unavailable",
+    "ai_configuration",
 ]
 
 
@@ -123,12 +127,16 @@ class StatsResult(BaseModel):
     saved: int
     applied: int
     interviews: int
+    test_tasks: int
+    offers: int
+    accepted_offers: int
     rejected: int
     average_score: float
     common_missing_skills: list[tuple[str, int]]
 
 
 HHApplicationStatus = Literal[
+    "demo",
     "draft",
     "awaiting_confirmation",
     "submitting",
@@ -157,10 +165,12 @@ class PreparedApplication(BaseModel):
     resume: HHResumeData
     resumes: list[HHResumeData]
     cover_letter: str
+    manual_submission_required: bool = False
 
 
 class ApplicationResult(BaseModel):
     status: HHApplicationStatus
     message: str
+    vacancy_id: int | None = None
     external_id: str | None = None
     manual_url: str | None = None

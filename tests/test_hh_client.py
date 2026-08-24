@@ -71,23 +71,60 @@ async def test_hh_client_search_deduplicates_scopes_and_gets_details() -> None:
     assert len(items) == 1
     assert details["id"] == "42"
     assert token_requests == 1
-    assert any(request.headers["HH-User-Agent"] == "TestAgent/1.0" for request in requests)
+    assert any(
+        request.headers["HH-User-Agent"] == "TestAgent/1.0" for request in requests
+    )
     api_requests = [request for request in requests if request.url.path != "/token"]
     assert all(
         request.headers["Authorization"] == "Bearer application-token"
         for request in api_requests
     )
     token_body = next(
-        request.content.decode()
-        for request in requests
-        if request.url.path == "/token"
+        request.content.decode() for request in requests if request.url.path == "/token"
     )
     assert "grant_type=client_credentials" in token_body
     assert "client_id=client" in token_body
     assert "client_secret=secret" in token_body
-    search_request = next(request for request in requests if request.url.path == "/vacancies")
+    search_request = next(
+        request for request in requests if request.url.path == "/vacancies"
+    )
     assert search_request.url.params["period"] == "7"
     assert search_request.url.params["order_by"] == "publication_time"
+
+
+@pytest.mark.asyncio
+async def test_hh_client_uses_configured_search_scope() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"access_token": "application-token"})
+        return httpx.Response(200, json={"items": [], "pages": 0})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.hh.ru"
+    ) as http_client:
+        client = HHClient(
+            "TestAgent/1.0",
+            http_client=http_client,
+            client_id="client",
+            client_secret="secret",
+            retries=0,
+            search_area_id="1",
+            search_period_days=14,
+            search_remote=False,
+        )
+        await client.search_vacancies("Python", max_results=10)
+
+    search_requests = [
+        request for request in requests if request.url.path == "/vacancies"
+    ]
+    assert len(search_requests) == 1
+    params = search_requests[0].url.params
+    assert params["area"] == "1"
+    assert params["period"] == "14"
+    assert "schedule" not in params
 
 
 def test_hh_html_and_mapping_handle_missing_optional_fields() -> None:
@@ -197,7 +234,10 @@ async def test_hh_client_gets_current_users_resumes() -> None:
 
     assert [item.external_id for item in resumes] == ["resume-1"]
     assert resumes[0].status == "published"
-    assert all(request.headers["Authorization"] == "Bearer secret-token" for request in requests)
+    assert all(
+        request.headers["Authorization"] == "Bearer secret-token"
+        for request in requests
+    )
 
 
 @pytest.mark.asyncio

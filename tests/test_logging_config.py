@@ -34,10 +34,7 @@ def test_json_formatter_emits_structured_fields_and_redacts_secrets() -> None:
 
 
 def test_text_redaction_covers_provider_credentials() -> None:
-    message = (
-        "token=secret-token sk-example123456 "
-        "123456789:telegram_token_value"
-    )
+    message = "token=secret-token sk-example123456 123456789:telegram_token_value"
 
     redacted = redact_text(message)
 

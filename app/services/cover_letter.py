@@ -3,21 +3,22 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
-
-from openai import OpenAIError
 
 from app.models import Vacancy
 from app.schemas import CandidateProfile
-from app.services.openai_errors import normalize_openai_error
+from app.services.ai_errors import AIServiceError
+from app.services.ai_provider import AIProvider
 
 logger = logging.getLogger(__name__)
+MAX_RESUME_CHARS = 20_000
+MAX_DESCRIPTION_CHARS = 12_000
+MAX_REQUIREMENTS_CHARS = 6_000
 
 
 class CoverLetterService:
     def __init__(
         self,
-        client: Any,
+        client: AIProvider,
         model_name: str,
         profile: CandidateProfile,
         resume: str,
@@ -36,12 +37,12 @@ class CoverLetterService:
         )
         data = {
             "profile": self.profile.model_dump(),
-            "resume": self.resume,
+            "resume": self.resume[:MAX_RESUME_CHARS],
             "vacancy": {
                 "title": vacancy.title,
                 "company": vacancy.company,
-                "description": vacancy.description[:15_000],
-                "requirements": vacancy.requirements,
+                "description": vacancy.description[:MAX_DESCRIPTION_CHARS],
+                "requirements": vacancy.requirements[:MAX_REQUIREMENTS_CHARS],
                 "key_skills": vacancy.key_skills,
             },
             "analysis": {
@@ -64,29 +65,32 @@ class CoverLetterService:
 
 Данные:
 {json.dumps(data, ensure_ascii=False)}"""
-        logger.info("Calling OpenAI cover-letter generator for vacancy %s", vacancy.id)
+        logger.info(
+            "Calling AI cover-letter generator for vacancy %s",
+            vacancy.id,
+            extra={"event": "ai_cover_letter_started", "provider": self.client.name},
+        )
         try:
-            response = await self.client.responses.create(
+            text = await self.client.generate_text(
                 model=self.model_name,
-                input=prompt,
+                prompt=prompt,
             )
-            text = (response.output_text or "").strip()
             if not text:
-                logger.warning("OpenAI returned an empty cover letter for %s", vacancy.id)
+                logger.warning(
+                    "AI provider returned an empty cover letter for %s", vacancy.id
+                )
                 return None
             return text
-        except OpenAIError as exc:
-            error = normalize_openai_error(exc)
+        except AIServiceError:
             logger.warning(
-                "OpenAI cover-letter request failed",
+                "AI cover-letter request failed",
                 extra={
-                    "event": "openai_cover_letter_failed",
+                    "event": "ai_cover_letter_failed",
+                    "provider": self.client.name,
                     "vacancy_id": vacancy.id,
-                    "error_code": error.code,
-                    "error_type": type(exc).__name__,
                 },
             )
-            raise error from exc
+            raise
         except Exception:
             logger.exception(
                 "Unexpected cover-letter processing error for vacancy %s",

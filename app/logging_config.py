@@ -41,15 +41,11 @@ _REDACTION_RULES = (
     ),
     (re.compile(r"(?i)(Bearer\s+)[^\s,;]+"), r"\1[REDACTED]"),
     (
-        re.compile(
-            r"(?i)((?:https?|socks4|socks5|socks5h)://)[^/@\s:]+:[^@\s]+@"
-        ),
+        re.compile(r"(?i)((?:https?|socks4|socks5|socks5h)://)[^/@\s:]+:[^@\s]+@"),
         r"\1[REDACTED]@",
     ),
     (
-        re.compile(
-            r"(?i)((?:token|api[_-]?key|secret|password)=)[^\s&,;]+"
-        ),
+        re.compile(r"(?i)((?:token|api[_-]?key|secret|password)=)[^\s&,;]+"),
         r"\1[REDACTED]",
     ),
 )
@@ -109,9 +105,7 @@ class JsonFormatter(logging.Formatter):
             if key not in _STANDARD_RECORD_FIELDS and not key.startswith("_"):
                 payload[key] = _redact_value(value, key=key)
         if record.exc_info:
-            payload["exception"] = redact_text(
-                self.formatException(record.exc_info)
-            )
+            payload["exception"] = redact_text(self.formatException(record.exc_info))
         if record.stack_info:
             payload["stack"] = redact_text(self.formatStack(record.stack_info))
         return json.dumps(

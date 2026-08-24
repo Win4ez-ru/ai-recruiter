@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
-
-from openai import OpenAIError
+from hashlib import sha256
 
 from app.models import Vacancy
 from app.schemas import CandidateProfile, VacancyAnalysisResult, VacancyFilterResult
-from app.services.openai_errors import normalize_openai_error
+from app.services.ai_errors import AIServiceError
+from app.services.ai_provider import AIProvider
 
 logger = logging.getLogger(__name__)
+PROMPT_VERSION = "vacancy-ranker-2026-08-24.v2"
+MAX_RESUME_CHARS = 20_000
+MAX_DESCRIPTION_CHARS = 12_000
+MAX_REQUIREMENTS_CHARS = 6_000
+MAX_RESPONSIBILITIES_CHARS = 6_000
 
 SYSTEM_PROMPT = """Ты оцениваешь соответствие вакансии реальному профилю кандидата.
 Правила:
@@ -31,7 +35,7 @@ SYSTEM_PROMPT = """Ты оцениваешь соответствие вакан
 class VacancyRanker:
     def __init__(
         self,
-        client: Any,
+        client: AIProvider,
         model_name: str,
         profile: CandidateProfile,
         resume: str,
@@ -41,12 +45,47 @@ class VacancyRanker:
         self.profile = profile
         self.resume = resume
 
-    async def rank(
+    @property
+    def provider_name(self) -> str:
+        return self.client.name
+
+    @property
+    def prompt_version(self) -> str:
+        return PROMPT_VERSION
+
+    def input_hash(self, vacancy: Vacancy, filter_result: VacancyFilterResult) -> str:
+        fingerprint = {
+            "provider": self.provider_name,
+            "model": self.model_name,
+            "prompt_version": self.prompt_version,
+            "payload": self._payload(vacancy, filter_result),
+        }
+        canonical = json.dumps(
+            fingerprint,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return sha256(canonical.encode("utf-8")).hexdigest()
+
+    def analysis_is_current(
         self, vacancy: Vacancy, filter_result: VacancyFilterResult
-    ) -> VacancyAnalysisResult | None:
-        payload = {
+    ) -> bool:
+        analysis = vacancy.analysis
+        return bool(
+            analysis is not None
+            and analysis.provider == self.provider_name
+            and analysis.model_name == self.model_name
+            and analysis.prompt_version == self.prompt_version
+            and analysis.input_hash == self.input_hash(vacancy, filter_result)
+        )
+
+    def _payload(
+        self, vacancy: Vacancy, filter_result: VacancyFilterResult
+    ) -> dict[str, object]:
+        return {
             "candidate_profile": self.profile.model_dump(),
-            "resume": self.resume,
+            "resume": self.resume[:MAX_RESUME_CHARS],
             "vacancy": {
                 "title": vacancy.title,
                 "company": vacancy.company,
@@ -59,46 +98,50 @@ class VacancyRanker:
                 "location": vacancy.location,
                 "work_format": vacancy.work_format,
                 "experience": vacancy.experience,
-                "description": vacancy.description[:20_000],
-                "requirements": vacancy.requirements,
-                "responsibilities": vacancy.responsibilities,
+                "description": vacancy.description[:MAX_DESCRIPTION_CHARS],
+                "requirements": vacancy.requirements[:MAX_REQUIREMENTS_CHARS],
+                "responsibilities": vacancy.responsibilities[
+                    :MAX_RESPONSIBILITIES_CHARS
+                ],
                 "key_skills": vacancy.key_skills,
             },
             "prefilter": filter_result.model_dump(),
         }
-        logger.info("Calling OpenAI ranker for vacancy %s", vacancy.id)
+
+    async def rank(
+        self, vacancy: Vacancy, filter_result: VacancyFilterResult
+    ) -> VacancyAnalysisResult | None:
+        payload = self._payload(vacancy, filter_result)
+        logger.info(
+            "Calling AI ranker for vacancy %s",
+            vacancy.id,
+            extra={"event": "ai_rank_started", "provider": self.client.name},
+        )
         try:
-            response = await self.client.responses.parse(
+            return await self.client.generate_structured(
                 model=self.model_name,
-                input=[
+                messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": json.dumps(payload, ensure_ascii=False),
                     },
                 ],
-                text_format=VacancyAnalysisResult,
+                response_model=VacancyAnalysisResult,
             )
-            parsed = response.output_parsed
-            if parsed is None:
-                logger.warning("OpenAI returned no parsed analysis for vacancy %s", vacancy.id)
-                return None
-            return VacancyAnalysisResult.model_validate(parsed)
-        except OpenAIError as exc:
-            error = normalize_openai_error(exc)
+        except AIServiceError:
             logger.warning(
-                "OpenAI analysis request failed",
+                "AI analysis request failed",
                 extra={
-                    "event": "openai_rank_failed",
+                    "event": "ai_rank_failed",
+                    "provider": self.client.name,
                     "vacancy_id": vacancy.id,
-                    "error_code": error.code,
-                    "error_type": type(exc).__name__,
                 },
             )
-            raise error from exc
+            raise
         except Exception:
             logger.exception(
-                "Unexpected OpenAI analysis processing error for vacancy %s",
+                "Unexpected AI analysis processing error for vacancy %s",
                 vacancy.id,
             )
             return None

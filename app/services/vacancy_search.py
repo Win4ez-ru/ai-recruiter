@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 
-from app.models import Vacancy
+from app.models import Vacancy, utc_now
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import SearchSummary, VacancyFilterResult
-from app.services.openai_errors import OpenAIServiceError
+from app.services.ai_errors import AIServiceError
 from app.services.vacancy_filter import VacancyFilter
 from app.services.vacancy_ranker import VacancyRanker
 from app.sources.hh import (
@@ -17,6 +18,7 @@ from app.sources.hh import (
     HHRemoteError,
     vacancy_from_hh,
 )
+from app.vacancy_status import is_excluded_from_recommendations
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +43,27 @@ class VacancySearchService:
         ranker: VacancyRanker,
         *,
         min_score: int,
+        refresh_ttl_hours: int = 24,
+        max_analyses_per_search: int = 25,
+        search_queries: list[str] | None = None,
     ) -> None:
         self.hh_client = hh_client
         self.repository = repository
         self.vacancy_filter = vacancy_filter
         self.ranker = ranker
         self.min_score = min_score
+        self.refresh_ttl_hours = refresh_ttl_hours
+        self.max_analyses_per_search = max_analyses_per_search
+        self.search_queries = list(search_queries or SEARCH_QUERIES)
 
     async def run(self, progress: ProgressCallback | None = None) -> SearchSummary:
         summary = SearchSummary()
         unique_items: dict[str, dict] = {}
-        for query in SEARCH_QUERIES:
+        for query_index, query in enumerate(self.search_queries, start=1):
+            if progress:
+                await progress(
+                    f"Запрашиваю HeadHunter: {query_index} из {len(self.search_queries)}."
+                )
             try:
                 items = await self.hh_client.search_vacancies(query, max_results=100)
             except HHApplicationAuthorizationError as exc:
@@ -118,13 +130,18 @@ class VacancySearchService:
         if not unique_items:
             return summary
 
-        existing_ids = await self.repository.existing_external_ids(
-            list(unique_items)
+        refresh_ids = await self.repository.external_ids_needing_refresh(
+            list(unique_items),
+            stale_before=utc_now() - timedelta(hours=self.refresh_ttl_hours),
         )
+        if progress:
+            await progress(
+                f"Загружаю детали новых и обновлённых вакансий: {len(refresh_ids)}."
+            )
         semaphore = asyncio.Semaphore(5)
 
         async def fetch_and_store(external_id: str) -> None:
-            if external_id in existing_ids:
+            if external_id not in refresh_ids:
                 return
             async with semaphore:
                 try:
@@ -144,43 +161,54 @@ class VacancySearchService:
         current_vacancies = await self.repository.list_by_external_ids(
             list(unique_items)
         )
+        relevant_count = 0
         relevant: list[tuple[Vacancy, VacancyFilterResult]] = []
         for vacancy in current_vacancies:
-            if vacancy.analysis is not None:
-                continue
             filter_result = self.vacancy_filter.evaluate(vacancy)
             if filter_result.is_relevant:
-                relevant.append((vacancy, filter_result))
+                relevant_count += 1
+                if not self.ranker.analysis_is_current(vacancy, filter_result):
+                    relevant.append((vacancy, filter_result))
             else:
                 logger.debug(
                     "Vacancy %s rejected by prefilter: %s",
                     vacancy.id,
                     "; ".join(filter_result.reasons),
                 )
-        summary.after_prefilter = len(relevant)
+        summary.after_prefilter = relevant_count
+        relevant.sort(key=lambda item: item[0].id, reverse=True)
+        relevant = relevant[: self.max_analyses_per_search]
         if progress:
             await progress(
-                f"После предварительной фильтрации: {summary.after_prefilter}."
+                f"Подходят после фильтрации: {summary.after_prefilter}. "
+                f"Требуют AI-анализа: {len(relevant)}."
             )
 
-        for vacancy, filter_result in relevant:
+        for index, (vacancy, filter_result) in enumerate(relevant, start=1):
+            if progress:
+                await progress(f"AI-анализ: {index} из {len(relevant)}.")
             try:
                 analysis = await self.ranker.rank(vacancy, filter_result)
                 if analysis is None:
                     summary.errors += 1
                     continue
                 await self.repository.save_analysis(
-                    vacancy.id, analysis, self.ranker.model_name
+                    vacancy.id,
+                    analysis,
+                    self.ranker.model_name,
+                    provider=self.ranker.provider_name,
+                    prompt_version=self.ranker.prompt_version,
+                    input_hash=self.ranker.input_hash(vacancy, filter_result),
                 )
                 summary.analyzed += 1
-            except OpenAIServiceError as exc:
+            except AIServiceError as exc:
                 summary.errors += 1
                 if exc.code not in summary.error_codes:
                     summary.error_codes.append(exc.code)
                 logger.warning(
-                    "Stopping OpenAI analysis for this search run",
+                    "Stopping AI analysis for this search run",
                     extra={
-                        "event": "openai_analysis_stopped",
+                        "event": "ai_analysis_stopped",
                         "error_code": exc.code,
                         "vacancy_id": vacancy.id,
                     },
@@ -188,9 +216,7 @@ class VacancySearchService:
                 break
             except Exception:
                 summary.errors += 1
-                logger.exception(
-                    "Failed to save analysis for vacancy %s", vacancy.id
-                )
+                logger.exception("Failed to save analysis for vacancy %s", vacancy.id)
 
         refreshed = await self.repository.list_by_external_ids(list(unique_items))
         summary.suitable = sum(
@@ -200,7 +226,7 @@ class VacancySearchService:
             and vacancy.analysis.match_score >= self.min_score
             and (
                 vacancy.application is None
-                or vacancy.application.status != "skipped"
+                or not is_excluded_from_recommendations(vacancy.application.status)
             )
         )
         logger.info(

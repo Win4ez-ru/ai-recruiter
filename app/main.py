@@ -5,23 +5,25 @@ import logging
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 
 import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
-from openai import AsyncOpenAI
 from pydantic import ValidationError
 
 from app.bot.callbacks import build_callbacks_router
 from app.bot.context import BotContext
 from app.bot.handlers import build_handlers_router
 from app.bot.hh_applications import build_hh_applications_router
+from app.bot.ui import UIManager
 from app.config import Settings, get_settings
 from app.database import Database
 from app.health import HealthRegistry, HealthStatus
 from app.logging_config import configure_logging
+from app.models import utc_now
 from app.network.retry import RetryPolicy
 from app.network.telegram import (
     FailoverTelegramSession,
@@ -33,8 +35,10 @@ from app.network.telegram import (
 from app.repositories.application_repository import ApplicationRepository
 from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
+from app.repositories.ui_state_repository import UIStateRepository
 from app.repositories.vacancy_repository import VacancyRepository
 from app.scheduler.jobs import create_scheduler
+from app.services.ai_provider import AIProvider, build_ai_provider
 from app.services.candidate_profile import (
     CandidateProfileError,
     load_candidate_profile,
@@ -114,8 +118,7 @@ async def async_main(settings: Settings) -> None:
     resume = load_resume(settings.resume_path)
     database: Database | None = None
     telegram_session: FailoverTelegramSession | None = None
-    openai_http_client: httpx.AsyncClient | None = None
-    openai_client: AsyncOpenAI | None = None
+    ai_provider: AIProvider | None = None
     hh_client: HHClient | None = None
     scheduler = None
     callback_server: ApplicationHTTPServer | None = None
@@ -137,16 +140,10 @@ async def async_main(settings: Settings) -> None:
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
             session=telegram_session,
         )
-        openai_http_client = httpx.AsyncClient(
-            proxy=settings.openai_proxy_value,
-            timeout=httpx.Timeout(settings.openai_timeout_seconds),
-            trust_env=settings.openai_trust_env,
-        )
-        openai_client = AsyncOpenAI(
-            api_key=settings.openai_api_key_value,
-            max_retries=settings.openai_max_retries,
-            timeout=settings.openai_timeout_seconds,
-            http_client=openai_http_client,
+        ai_provider, ai_model = build_ai_provider(settings)
+        logger.info(
+            "AI provider configured",
+            extra={"event": "ai_provider_configured", "provider": ai_provider.name},
         )
         hh_client = HHClient(
             settings.hh_user_agent,
@@ -169,6 +166,9 @@ async def async_main(settings: Settings) -> None:
             ),
             proxy_url=settings.hh_proxy_value,
             trust_env=settings.hh_trust_env,
+            search_area_id=settings.hh_search_area_id,
+            search_period_days=settings.hh_search_period_days,
+            search_remote=settings.hh_search_remote,
         )
         if settings.database_auto_create:
             await database.create_tables()
@@ -179,11 +179,26 @@ async def async_main(settings: Settings) -> None:
         application_repository = ApplicationRepository(database)
         hh_integration_repository = HHIntegrationRepository(database)
         hh_application_repository = HHApplicationRepository(database)
-        ranker = VacancyRanker(
-            openai_client, settings.openai_model, profile, resume
+        (
+            repaired,
+            recovered,
+        ) = await hh_application_repository.reconcile_incomplete_finalizations(
+            stale_before=utc_now()
+            - timedelta(seconds=settings.hh_submission_recovery_seconds)
         )
+        if repaired or recovered:
+            logger.warning(
+                "Reconciled HeadHunter application state",
+                extra={
+                    "event": "hh_application_reconciled",
+                    "repaired": repaired,
+                    "recovered_unknown": recovered,
+                },
+            )
+        ui = UIManager(UIStateRepository(database, settings.telegram_user_id))
+        ranker = VacancyRanker(ai_provider, ai_model, profile, resume)
         cover_letter_service = CoverLetterService(
-            openai_client, settings.openai_model, profile, resume
+            ai_provider, ai_model, profile, resume
         )
         search_service = VacancySearchService(
             hh_client,
@@ -191,6 +206,9 @@ async def async_main(settings: Settings) -> None:
             VacancyFilter(),
             ranker,
             min_score=settings.min_score_to_send,
+            refresh_ttl_hours=settings.vacancy_refresh_ttl_hours,
+            max_analyses_per_search=settings.max_ai_analyses_per_search,
+            search_queries=settings.hh_search_queries,
         )
         hh_oauth_service = HHOAuthService(
             hh_client, hh_integration_repository, settings
@@ -205,6 +223,7 @@ async def async_main(settings: Settings) -> None:
             cover_letter_service=cover_letter_service,
             confirmation_ttl_seconds=settings.hh_confirmation_ttl_seconds,
             default_resume_id=settings.hh_default_resume_id,
+            demo_mode=settings.demo_mode,
         )
         context = BotContext(
             settings=settings,
@@ -212,34 +231,36 @@ async def async_main(settings: Settings) -> None:
             vacancy_repository=vacancy_repository,
             application_repository=application_repository,
             search_service=search_service,
-            digest_service=DigestService(vacancy_repository),
+            digest_service=DigestService(vacancy_repository, ui),
             cover_letter_service=cover_letter_service,
             hh_integration_repository=hh_integration_repository,
             hh_application_repository=hh_application_repository,
             hh_oauth_service=hh_oauth_service,
             hh_application_service=hh_application_service,
             search_lock=asyncio.Lock(),
+            ui=ui,
         )
         dispatcher = Dispatcher()
+        dispatcher.include_router(build_handlers_router(context))
         dispatcher.include_router(build_hh_applications_router(context))
         dispatcher.include_router(build_callbacks_router(context))
-        dispatcher.include_router(build_handlers_router(context))
         scheduler = create_scheduler(bot, context)
         callback_server = ApplicationHTTPServer(
             settings=settings,
             oauth_service=hh_oauth_service,
             bot=bot,
             health=health,
+            ui=ui,
         )
 
         await callback_server.start()
-        health.mark_ready()
         await wait_for_telegram(
             bot,
             BOT_COMMANDS,
             backoff_config=telegram_backoff_config(settings),
         )
         health.set_component("telegram", "ok")
+        health.mark_ready()
         scheduler.start()
         logger.info("Job Agent started")
         await dispatcher.start_polling(
@@ -263,10 +284,8 @@ async def async_main(settings: Settings) -> None:
             await _close_resource("http_server", callback_server.close)
         if hh_client is not None:
             await _close_resource("hh_client", hh_client.close)
-        if openai_client is not None:
-            await _close_resource("openai_client", openai_client.close)
-        elif openai_http_client is not None:
-            await _close_resource("openai_http_client", openai_http_client.aclose)
+        if ai_provider is not None:
+            await _close_resource("ai_provider", ai_provider.close)
         if telegram_session is not None:
             await _close_resource("telegram_session", telegram_session.close)
         if database is not None:
@@ -290,9 +309,7 @@ def run() -> None:
     try:
         settings = get_settings()
     except ValidationError as exc:
-        fields = ", ".join(
-            str(error.get("loc", ["?"])[0]) for error in exc.errors()
-        )
+        fields = ", ".join(str(error.get("loc", ["?"])[0]) for error in exc.errors())
         print(
             f"Ошибка конфигурации. Проверьте .env. Поля: {fields}",
             file=sys.stderr,

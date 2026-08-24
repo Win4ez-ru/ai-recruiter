@@ -51,7 +51,9 @@ class HHOAuthService:
             telegram_user_id=telegram_user_id, raw_state=state
         )
         if oauth_state is None:
-            raise HHAuthorizationError("OAuth state is invalid, expired, or already used")
+            raise HHAuthorizationError(
+                "OAuth state is invalid, expired, or already used"
+            )
         payload = await self.client.exchange_code(
             authorization_code=code,
             code_verifier=oauth_state.code_verifier,
@@ -104,7 +106,9 @@ class HHOAuthService:
         scope = (
             " ".join(str(item) for item in scope_value)
             if isinstance(scope_value, list)
-            else str(scope_value) if scope_value else None
+            else str(scope_value)
+            if scope_value
+            else None
         )
         return await self.repository.save_integration(
             telegram_user_id=telegram_user_id,

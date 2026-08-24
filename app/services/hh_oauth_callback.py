@@ -6,6 +6,8 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiohttp import web
 
+from app.bot.keyboards import hh_connected_keyboard
+from app.bot.ui import UIManager
 from app.config import Settings
 from app.health import HealthRegistry
 from app.services.hh_oauth import HHOAuthService
@@ -22,11 +24,13 @@ class ApplicationHTTPServer:
         oauth_service: HHOAuthService,
         bot: Bot,
         health: HealthRegistry,
+        ui: UIManager | None = None,
     ) -> None:
         self.settings = settings
         self.oauth_service = oauth_service
         self.bot = bot
         self.health = health
+        self.ui = ui
         self._runner: web.AppRunner | None = None
 
     async def start(self) -> None:
@@ -111,10 +115,21 @@ class ApplicationHTTPServer:
                 status=503,
             )
         try:
-            await self.bot.send_message(
-                self.settings.telegram_user_id,
-                "HeadHunter успешно подключен. Теперь можно подготовить отклик.",
+            text = (
+                "<b>✅ HeadHunter подключён</b>\n\n"
+                "Теперь можно готовить и отправлять отклики из карточек вакансий."
             )
+            if self.ui is not None:
+                session = await self.ui.restore(self.settings.telegram_user_id)
+                await self.ui.render_chat(
+                    self.bot,
+                    self.settings.telegram_user_id,
+                    text,
+                    hh_connected_keyboard(session.pending_vacancy_id),
+                    screen="hh_connected",
+                )
+            else:
+                await self.bot.send_message(self.settings.telegram_user_id, text)
         except TelegramAPIError:
             logger.warning("HH OAuth succeeded, but Telegram notification failed")
         return web.Response(

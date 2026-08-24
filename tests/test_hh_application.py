@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 import pytest_asyncio
 
 from app.database import Database
-from app.models import Application, HHApplication
+from app.models import Application, HHApplication, utc_now
 from app.repositories.application_repository import ApplicationRepository
 from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
@@ -14,6 +15,7 @@ from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import HHResumeData, VacancyCreate
 from app.services.hh_application import (
     MANUAL_RESUME_EXTERNAL_ID,
+    HHAlreadyAppliedError,
     HHApplicationService,
     HHNotAuthorizedError,
     HHResumeSelectionRequired,
@@ -51,9 +53,7 @@ class FakeHHClient:
         self.resume_list_error: Exception | None = None
         self.application_error: Exception | None = None
         self.application_calls = 0
-        self.vacancy_details: dict = {
-            "apply_alternate_url": "https://hh.ru/vacancy/1"
-        }
+        self.vacancy_details: dict = {"apply_alternate_url": "https://hh.ru/vacancy/1"}
 
     async def get_my_resumes(self, token: str) -> list[HHResumeData]:
         if self.resume_list_error is not None:
@@ -91,6 +91,7 @@ async def make_service(
     resumes: list[HHResumeData] | None = None,
     oauth_token: str | None = "token",
     default_resume_id: str = "",
+    demo_mode: bool = False,
 ) -> tuple[HHApplicationService, int, HHApplicationRepository]:
     vacancy_repository = VacancyRepository(database)
     vacancy, _ = await vacancy_repository.create_if_new(
@@ -124,8 +125,30 @@ async def make_service(
         cover_letter_service=FakeCoverLetter(),  # type: ignore[arg-type]
         confirmation_ttl_seconds=900,
         default_resume_id=default_resume_id,
+        demo_mode=demo_mode,
     )
     return service, vacancy.id, application_repository
+
+
+@pytest.mark.asyncio
+async def test_demo_mode_runs_confirmation_without_external_submission(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database, demo_mode=True)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    row = await repository.get_owned(preview.draft_id, 42)
+
+    assert result.status == "demo"
+    assert "не отправлен" in result.message
+    assert service.hh_client.application_calls == 0  # type: ignore[attr-defined]
+    assert row is not None and row.error_code == "demo_mode"
 
 
 @pytest.mark.asyncio
@@ -152,9 +175,7 @@ async def test_prepare_uses_manual_fallback_when_hh_blocks_resume_list(
     )
 
     preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
-    restored = await service.get_preview(
-        user_id=42, application_id=preview.draft_id
-    )
+    restored = await service.get_preview(user_id=42, application_id=preview.draft_id)
     confirmation = await service.create_confirmation(
         user_id=42, application_id=preview.draft_id
     )
@@ -166,8 +187,10 @@ async def test_prepare_uses_manual_fallback_when_hh_blocks_resume_list(
     assert preview.resume.external_id == MANUAL_RESUME_EXTERNAL_ID
     assert preview.resume.title == "Выбрать на сайте HeadHunter"
     assert preview.resumes == []
+    assert preview.manual_submission_required is True
     assert restored is not None
     assert restored.resume.external_id == MANUAL_RESUME_EXTERNAL_ID
+    assert restored.manual_submission_required is True
     assert service.hh_client.application_calls == 0  # type: ignore[attr-defined]
     assert result.status == "manual_action_required"
     assert result.manual_url == "https://hh.ru/vacancy/1"
@@ -189,9 +212,7 @@ async def test_configured_resume_fallback_can_submit(
     )
 
     preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
-    restored = await service.get_preview(
-        user_id=42, application_id=preview.draft_id
-    )
+    restored = await service.get_preview(user_id=42, application_id=preview.draft_id)
     confirmation = await service.create_confirmation(
         user_id=42, application_id=preview.draft_id
     )
@@ -201,6 +222,7 @@ async def test_configured_resume_fallback_can_submit(
     row = await repository.get_owned(preview.draft_id, 42)
 
     assert preview.resume.external_id == "configured-resume"
+    assert preview.manual_submission_required is False
     assert restored is not None
     assert restored.resume.external_id == "configured-resume"
     assert result.status == "submitted"
@@ -363,11 +385,90 @@ async def test_successful_submission_marks_vacancy_applied(database: Database) -
     async with database.session_factory() as session:
         legacy = await session.get(Application, vacancy_id)
         hh_application = await session.get(HHApplication, preview.draft_id)
-    assert legacy is not None and legacy.status == "applied"
+    assert legacy is not None and legacy.status == "applied_bot"
+    assert legacy.application_source == "bot"
+    assert legacy.applied_at is not None
     assert hh_application is not None
     assert hh_application.confirmed_at is not None
     assert hh_application.submitting_at is not None
     assert hh_application.submitted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_successful_submission_overrides_concurrent_hidden_status(
+    database: Database,
+) -> None:
+    service, vacancy_id, _ = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    await service.status_repository.hide(vacancy_id)
+
+    result = await service.submit_application(
+        user_id=42,
+        confirmation_token=confirmation.token,
+    )
+    lifecycle = await service.status_repository.get(vacancy_id)
+
+    assert result.status == "submitted"
+    assert result.vacancy_id == vacancy_id
+    assert lifecycle is not None and lifecycle.status == "applied_bot"
+    assert lifecycle.application_source == "bot"
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciles_legacy_submitted_row(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    first = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    await repository.mark_submitted(first.draft_id, external_id="legacy-response")
+
+    repaired, recovered = await repository.reconcile_incomplete_finalizations(
+        stale_before=utc_now() - timedelta(minutes=5)
+    )
+    lifecycle = await service.status_repository.get(vacancy_id)
+
+    assert (repaired, recovered) == (1, 0)
+    assert lifecycle is not None and lifecycle.status == "applied_bot"
+    assert lifecycle.application_source == "bot"
+
+
+@pytest.mark.asyncio
+async def test_startup_quarantines_abandoned_submission_lease(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    lease = await repository.acquire_submission(
+        raw_token=confirmation.token, telegram_user_id=42
+    )
+    assert lease.outcome == "acquired"
+
+    repaired, recovered = await repository.reconcile_incomplete_finalizations(
+        stale_before=utc_now() + timedelta(seconds=1)
+    )
+    abandoned = await repository.get_owned(preview.draft_id, 42)
+
+    assert (repaired, recovered) == (0, 1)
+    assert abandoned is not None
+    assert abandoned.api_status == "manual_action_required"
+    assert abandoned.error_code == "submission_result_unknown"
+
+
+@pytest.mark.asyncio
+async def test_registered_manual_application_blocks_stale_bot_action(
+    database: Database,
+) -> None:
+    service, vacancy_id, _ = await make_service(database)
+    await service.status_repository.mark_applied_manual(vacancy_id)
+
+    with pytest.raises(HHAlreadyAppliedError):
+        await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
 
 
 @pytest.mark.asyncio
@@ -387,10 +488,14 @@ async def test_already_applied_is_treated_as_submitted(database: Database) -> No
         user_id=42, confirmation_token=confirmation.token
     )
     row = await repository.get_owned(preview.draft_id, 42)
+    lifecycle = await service.status_repository.get(vacancy_id)
 
     assert result.status == "submitted"
     assert "уже существует" in result.message
     assert row is not None and row.api_status == "submitted"
+    assert lifecycle is not None and lifecycle.status == "applied_manual"
+    assert lifecycle.status_source == "import"
+    assert lifecycle.application_source == "manual"
 
 
 @pytest.mark.asyncio

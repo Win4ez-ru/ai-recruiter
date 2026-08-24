@@ -1,6 +1,11 @@
 from aiogram.filters.callback_data import CallbackData
 
 
+class ScreenCallback(CallbackData, prefix="ui"):
+    action: str
+    value: int = 0
+
+
 class VacancyCallback(CallbackData, prefix="vac"):
     action: str
     vacancy_id: int

@@ -232,9 +232,7 @@ def build_telegram_session(
     routes: list[TelegramRoute] = []
     timeout = settings.telegram_request_timeout_seconds
     if settings.telegram_direct_enabled:
-        routes.append(
-            TelegramRoute("direct", _build_route_session(timeout=timeout))
-        )
+        routes.append(TelegramRoute("direct", _build_route_session(timeout=timeout)))
     for index, proxy_url in enumerate(settings.telegram_proxy_values, start=1):
         routes.append(
             TelegramRoute(

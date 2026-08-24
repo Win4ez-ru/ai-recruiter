@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from app.bot.ui import UIManager
 from app.config import Settings
 from app.repositories.application_repository import ApplicationRepository
 from app.repositories.hh_application_repository import HHApplicationRepository
@@ -30,3 +31,4 @@ class BotContext:
     hh_oauth_service: HHOAuthService
     hh_application_service: HHApplicationService
     search_lock: asyncio.Lock
+    ui: UIManager

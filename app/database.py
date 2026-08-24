@@ -52,9 +52,7 @@ class Database:
                 }
             )
         elif normalized_url.startswith("sqlite+aiosqlite://"):
-            engine_options["connect_args"] = {
-                "timeout": connect_timeout_seconds
-            }
+            engine_options["connect_args"] = {"timeout": connect_timeout_seconds}
         self.engine: AsyncEngine = create_async_engine(
             normalized_url,
             **engine_options,

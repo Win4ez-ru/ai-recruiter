@@ -61,6 +61,11 @@ class Vacancy(Base):
     application: Mapped[Application | None] = relationship(
         back_populates="vacancy", cascade="all, delete-orphan", uselist=False
     )
+    status_history: Mapped[list[VacancyStatusHistory]] = relationship(
+        back_populates="vacancy",
+        cascade="all, delete-orphan",
+        order_by="VacancyStatusHistory.changed_at",
+    )
 
 
 class VacancyAnalysis(Base):
@@ -81,8 +86,16 @@ class VacancyAnalysis(Base):
     resume_focus: Mapped[list[str]] = mapped_column(JSON, default=list)
     reason: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(128))
+    provider: Mapped[str] = mapped_column(String(32), default="legacy", index=True)
+    prompt_version: Mapped[str] = mapped_column(String(64), default="legacy")
+    input_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
     vacancy: Mapped[Vacancy] = relationship(back_populates="analysis")
@@ -96,6 +109,11 @@ class Application(Base):
         ForeignKey("vacancies.id", ondelete="CASCADE"), unique=True, index=True
     )
     status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    status_source: Mapped[str] = mapped_column(String(32), default="system")
+    application_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status_changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
     cover_letter: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -109,10 +127,31 @@ class Application(Base):
     vacancy: Mapped[Vacancy] = relationship(back_populates="application")
 
 
+class VacancyStatusHistory(Base):
+    __tablename__ = "vacancy_status_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vacancy_id: Mapped[int] = mapped_column(
+        ForeignKey("vacancies.id", ondelete="CASCADE"), index=True
+    )
+    from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(32), index=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+
+    vacancy: Mapped[Vacancy] = relationship(back_populates="status_history")
+
+
 class UserIntegration(Base):
     __tablename__ = "user_integrations"
     __table_args__ = (
-        UniqueConstraint("telegram_user_id", "provider", name="uq_user_integration_provider"),
+        UniqueConstraint(
+            "telegram_user_id", "provider", name="uq_user_integration_provider"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -123,7 +162,9 @@ class UserIntegration(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scope: Mapped[str | None] = mapped_column(Text, nullable=True)
     external_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
@@ -138,14 +179,20 @@ class OAuthState(Base):
     state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     code_verifier: Mapped[str] = mapped_column(String(160))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
 
 class HHResume(Base):
     __tablename__ = "hh_resumes"
     __table_args__ = (
-        UniqueConstraint("telegram_user_id", "external_id", name="uq_hh_resume_user_external"),
+        UniqueConstraint(
+            "telegram_user_id", "external_id", name="uq_hh_resume_user_external"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -154,10 +201,16 @@ class HHResume(Base):
     title: Mapped[str] = mapped_column(String(500))
     status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    external_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    external_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
@@ -186,15 +239,21 @@ class HHApplication(Base):
     cover_letter: Mapped[str] = mapped_column(Text)
     process_status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
     api_status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
-    external_application_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    external_application_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    prepared_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     submitting_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
@@ -205,15 +264,43 @@ class ApplicationConfirmation(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_user_id: Mapped[int] = mapped_column(index=True)
-    vacancy_id: Mapped[int] = mapped_column(ForeignKey("vacancies.id", ondelete="CASCADE"))
+    vacancy_id: Mapped[int] = mapped_column(
+        ForeignKey("vacancies.id", ondelete="CASCADE")
+    )
     resume_external_id: Mapped[str] = mapped_column(String(128))
     application_id: Mapped[int] = mapped_column(
         ForeignKey("hh_applications.id", ondelete="CASCADE"), index=True
     )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+
+class BotUISession(Base):
+    __tablename__ = "bot_ui_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True)
+    chat_id: Mapped[int] = mapped_column(unique=True, index=True)
+    message_id: Mapped[int] = mapped_column()
+    screen: Mapped[str] = mapped_column(String(64), default="menu")
+    collection_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    collection_title: Mapped[str] = mapped_column(String(128), default="Вакансии")
+    collection_kind: Mapped[str] = mapped_column(String(32), default="custom")
+    collection_index: Mapped[int] = mapped_column(Integer, default=0)
+    expanded: Mapped[bool] = mapped_column(Boolean, default=False)
+    pending_vacancy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
 
 
 JsonDict = dict[str, Any]
