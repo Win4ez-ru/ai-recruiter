@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ssl
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -150,6 +151,24 @@ async def test_close_releases_every_route() -> None:
 
     assert direct.closed is True
     assert proxy.closed is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_prevents_new_route_attempts() -> None:
+    direct = FakeSession("unused")
+    proxy = FakeSession("unused")
+    session = FailoverTelegramSession(
+        [TelegramRoute("direct", direct), TelegramRoute("proxy-1", proxy)]
+    )
+    bot = Bot("123456:TEST_TOKEN", session=session)
+
+    session.begin_shutdown()
+
+    with pytest.raises(asyncio.CancelledError):
+        await session.make_request(bot, GetUpdates())
+    assert direct.calls == []
+    assert proxy.calls == []
+    await session.close()
 
 
 @pytest.mark.asyncio

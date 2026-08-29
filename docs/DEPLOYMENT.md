@@ -117,6 +117,12 @@ OpenAI и YandexGPT используют отдельные HTTPX transports и 
 timeout/retry. Пользователю показывается общая безопасная категория AI-ошибки
 без токена, сырого ответа или traceback.
 
+`AI_RANKING_CONCURRENCY=3` ограничивает число одновременных облачных ranking-
+запросов. Для `AI_PROVIDER=ollama` composition root принудительно использует
+concurrency `1`, чтобы локальная модель не конкурировала сама с собой за RAM.
+Structured logs содержат длительности HH/AI, число реальных AI-вызовов и cache
+hits.
+
 Рекомендуемая конфигурация Yandex AI Studio:
 
 ```env
@@ -126,6 +132,7 @@ YANDEX_FOLDER_ID=
 YANDEX_MODEL=yandexgpt-5.1
 YANDEX_BASE_URL=https://ai.api.cloud.yandex.net/v1
 YANDEX_DATA_LOGGING_ENABLED=false
+AI_RANKING_CONCURRENCY=3
 ```
 
 Для долгоживущего процесса используйте сервисный аккаунт с ролью
@@ -172,8 +179,8 @@ PaaS-переменная `PORT` имеет приоритет над `HTTP_PORT
   HTTP-сервер.
 - `GET /health/ready` возвращает `503` до завершения внутренней инициализации и
   во время остановки.
-- Временная недоступность внешнего провайдера отражается статусом `degraded`,
-  но не превращает процесс в бесконечный restart loop.
+- Внешние HH/AI ошибки отражаются в результате конкретной операции и structured
+  logs, но не делают liveness отрицательным и не запускают restart loop.
 
 Для liveness/restart probe используйте `/health/live`. Для снятия экземпляра с
 пользовательского трафика — `/health/ready`.

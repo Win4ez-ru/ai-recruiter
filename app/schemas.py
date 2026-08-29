@@ -31,6 +31,7 @@ SearchErrorCode = Literal[
     "ai_rate_limited",
     "ai_unavailable",
     "ai_configuration",
+    "ai_invalid_response",
 ]
 
 
@@ -116,9 +117,13 @@ class SearchSummary(BaseModel):
     new_vacancies: int = 0
     after_prefilter: int = 0
     analyzed: int = 0
+    ai_requests: int = 0
+    cached_analyses: int = 0
     suitable: int = 0
     errors: int = 0
     error_codes: list[SearchErrorCode] = Field(default_factory=list)
+    hh_duration_seconds: float = Field(default=0.0, ge=0)
+    ai_duration_seconds: float = Field(default=0.0, ge=0)
 
 
 class StatsResult(BaseModel):
@@ -172,5 +177,11 @@ class ApplicationResult(BaseModel):
     status: HHApplicationStatus
     message: str
     vacancy_id: int | None = None
+    application_id: int | None = None
     external_id: str | None = None
     manual_url: str | None = None
+    error_code: str | None = None
+    can_retry: bool = False
+    can_mark_applied: bool = False
+    requires_oauth: bool = False
+    result_uncertain: bool = False

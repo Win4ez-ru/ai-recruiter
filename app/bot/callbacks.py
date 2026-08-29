@@ -21,6 +21,7 @@ from app.bot.screens import (
     manual_application_registered_text,
 )
 from app.bot.views import (
+    current_analysis_scope,
     run_search,
     show_collection_kind,
     show_current_collection,
@@ -58,6 +59,7 @@ def build_callbacks_router(context: BotContext) -> Router:
             context.settings.min_score_to_send,
             100,
             only_unsent=False,
+            **current_analysis_scope(context),
         )
         ids = [vacancy.id for vacancy in vacancies]
         if vacancy_id not in ids:

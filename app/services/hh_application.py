@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import httpx
+
 from app.models import HHApplication, HHResume
-from app.repositories.application_repository import ApplicationRepository
 from app.repositories.hh_application_repository import HHApplicationRepository
 from app.repositories.hh_integration_repository import HHIntegrationRepository
 from app.repositories.vacancy_repository import VacancyRepository
@@ -24,24 +25,54 @@ from app.vacancy_status import has_registered_application
 logger = logging.getLogger(__name__)
 MANUAL_RESUME_EXTERNAL_ID = "__select_on_hh__"
 MANUAL_RESUME_TITLE = "Выбрать на сайте HeadHunter"
-APPLICATION_ERROR_MESSAGES = {
+APPLICATION_ERROR_POLICIES = {
     "test_required": (
         "test_required",
         "Для отклика требуется пройти тест на HeadHunter.",
+        False,
+        True,
     ),
     "resume_not_found": (
         "resume_not_found",
         "Резюме больше недоступно. Выберите его на HeadHunter.",
+        False,
+        True,
     ),
     "resume_visibility_conflict": (
         "resume_visibility_conflict",
         "Видимость резюме не позволяет отправить этот отклик.",
+        False,
+        True,
     ),
     "invalid_vacancy": (
         "vacancy_unavailable",
         "Вакансия закрыта или больше недоступна.",
+        False,
+        False,
     ),
 }
+RETRYABLE_APPLICATION_ERRORS = frozenset(
+    {"rate_limit", "temporary_hh_error", "hh_connection_failed"}
+)
+MANUAL_COMPLETION_ERRORS = frozenset(
+    {
+        "application_denied",
+        "authorization_expired",
+        "external_response_form",
+        "hh_connection_failed",
+        "hh_request_failed",
+        "rate_limit",
+        "resume_not_found",
+        "resume_selection_required",
+        "resume_visibility_conflict",
+        "submission_result_unknown",
+        "temporary_hh_error",
+        "test_required",
+    }
+)
+UNCERTAIN_APPLICATION_ERRORS = frozenset(
+    {"hh_request_failed", "submission_result_unknown"}
+)
 
 
 class HHApplicationError(RuntimeError):
@@ -130,23 +161,42 @@ def _configured_resume_data(external_id: str) -> HHResumeData:
     )
 
 
-def _application_error_details(exc: HHRemoteError) -> tuple[str, str]:
-    known = APPLICATION_ERROR_MESSAGES.get(exc.error_value or "")
+def _application_error_details(
+    exc: HHRemoteError,
+) -> tuple[str, str, bool, bool]:
+    """Return code, message, retryability and manual-completion availability."""
+
+    known = APPLICATION_ERROR_POLICIES.get(exc.error_value or "")
     if known is not None:
         return known
     if exc.status_code == 429:
         return (
             "rate_limit",
             "HeadHunter временно ограничил число запросов. Попробуйте позже.",
+            True,
+            True,
         )
     if exc.status_code >= 500:
         return (
             "temporary_hh_error",
             "HeadHunter временно недоступен. Попробуйте позже.",
+            True,
+            True,
         )
     return (
         "application_denied",
         "HeadHunter не разрешил автоматический отклик. Завершите его на сайте.",
+        False,
+        True,
+    )
+
+
+def _transport_failure_is_safe_to_retry(exc: HHTransportError) -> bool:
+    """Connect/pool failures happen before the non-idempotent POST is accepted."""
+
+    return isinstance(
+        exc.__cause__,
+        (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
     )
 
 
@@ -164,7 +214,6 @@ class HHApplicationService:
         oauth_service: HHOAuthService,
         integration_repository: HHIntegrationRepository,
         application_repository: HHApplicationRepository,
-        status_repository: ApplicationRepository,
         vacancy_repository: VacancyRepository,
         cover_letter_service: CoverLetterService,
         confirmation_ttl_seconds: int,
@@ -175,7 +224,6 @@ class HHApplicationService:
         self.oauth_service = oauth_service
         self.integration_repository = integration_repository
         self.application_repository = application_repository
-        self.status_repository = status_repository
         self.vacancy_repository = vacancy_repository
         self.cover_letter_service = cover_letter_service
         self.confirmation_ttl_seconds = confirmation_ttl_seconds
@@ -392,6 +440,8 @@ class HHApplicationService:
         code: str,
         message: str,
         manual_url: str | None,
+        can_mark_applied: bool = False,
+        result_uncertain: bool = False,
     ) -> ApplicationResult:
         application = await self.application_repository.mark_manual_action(
             application_id,
@@ -402,7 +452,39 @@ class HHApplicationService:
             status="manual_action_required",
             message=message,
             vacancy_id=application.vacancy_id,
+            application_id=application.id,
             manual_url=manual_url,
+            error_code=code,
+            can_mark_applied=can_mark_applied,
+            result_uncertain=result_uncertain,
+        )
+
+    async def _failed_result(
+        self,
+        application_id: int,
+        *,
+        code: str,
+        message: str,
+        manual_url: str | None,
+        can_retry: bool,
+        can_mark_applied: bool = False,
+        requires_oauth: bool = False,
+    ) -> ApplicationResult:
+        application = await self.application_repository.mark_failed(
+            application_id,
+            code=code,
+            message=message,
+        )
+        return ApplicationResult(
+            status="failed",
+            message=message,
+            vacancy_id=application.vacancy_id,
+            application_id=application.id,
+            manual_url=manual_url,
+            error_code=code,
+            can_retry=can_retry,
+            can_mark_applied=can_mark_applied,
+            requires_oauth=requires_oauth,
         )
 
     async def _submitted_result(
@@ -422,6 +504,7 @@ class HHApplicationService:
             status="submitted",
             message=message,
             vacancy_id=application.vacancy_id,
+            application_id=application.id,
             external_id=external_id,
         )
 
@@ -440,15 +523,50 @@ class HHApplicationService:
             "submitted": "Отклик уже был отправлен.",
         }
         if lease.outcome != "acquired" or lease.application is None:
-            status = "submitted" if lease.outcome == "submitted" else "failed"
+            application = lease.application
+            error_code = application.error_code if application is not None else None
+            status = (
+                "submitted"
+                if lease.outcome == "submitted"
+                else "manual_action_required"
+                if application is not None
+                and application.api_status == "manual_action_required"
+                else "failed"
+            )
+            can_retry = bool(
+                application is not None
+                and (
+                    (
+                        lease.outcome == "expired"
+                        and application.api_status == "awaiting_confirmation"
+                    )
+                    or (
+                        application.api_status == "failed"
+                        and error_code in RETRYABLE_APPLICATION_ERRORS
+                    )
+                )
+            )
+            manual_url: str | None = None
+            if application is not None:
+                vacancy = await self.vacancy_repository.get_by_id(
+                    application.vacancy_id
+                )
+                manual_url = vacancy.url if vacancy is not None else None
             return ApplicationResult(
                 status=status,
-                message=messages[lease.outcome],
-                vacancy_id=(
-                    lease.application.vacancy_id
-                    if lease.application is not None
-                    else None
+                message=(
+                    application.error_message
+                    if application is not None and application.error_message
+                    else messages[lease.outcome]
                 ),
+                vacancy_id=application.vacancy_id if application is not None else None,
+                application_id=application.id if application is not None else None,
+                manual_url=manual_url,
+                error_code=error_code,
+                can_retry=can_retry,
+                can_mark_applied=error_code in MANUAL_COMPLETION_ERRORS,
+                requires_oauth=error_code == "authorization_expired",
+                result_uncertain=error_code in UNCERTAIN_APPLICATION_ERRORS,
             )
         application = lease.application
         vacancy = await self.vacancy_repository.get_by_id(application.vacancy_id)
@@ -482,6 +600,7 @@ class HHApplicationService:
                 code="external_response_form",
                 message="Для этой вакансии отклик заполняется на сайте работодателя.",
                 manual_url=manual_url,
+                can_mark_applied=True,
             )
         if details.get("has_test") or (
             isinstance(details.get("test"), dict) and details["test"].get("required")
@@ -494,6 +613,7 @@ class HHApplicationService:
                     "HeadHunter."
                 ),
                 manual_url=manual_url,
+                can_mark_applied=True,
             )
         if application.resume_external_id == MANUAL_RESUME_EXTERNAL_ID:
             return await self._manual_result(
@@ -501,6 +621,7 @@ class HHApplicationService:
                 code="resume_selection_required",
                 message="Откройте вакансию и выберите резюме на HeadHunter.",
                 manual_url=manual_url,
+                can_mark_applied=True,
             )
 
         if self.demo_mode:
@@ -517,6 +638,7 @@ class HHApplicationService:
                     "случайного действия."
                 ),
                 vacancy_id=application.vacancy_id,
+                application_id=application.id,
                 manual_url=manual_url,
             )
 
@@ -529,11 +651,17 @@ class HHApplicationService:
                 message=application.cover_letter,
             )
         except (HHNotAuthorizedError, HHAuthorizationError):
-            return await self._manual_result(
+            return await self._failed_result(
                 application.id,
                 code="authorization_expired",
-                message="Авторизация HeadHunter истекла. Подключите аккаунт заново.",
+                message=(
+                    "Авторизация HeadHunter истекла. Письмо и выбранное резюме "
+                    "сохранены — подключите аккаунт заново и продолжите отклик."
+                ),
                 manual_url=manual_url,
+                can_retry=False,
+                can_mark_applied=True,
+                requires_oauth=True,
             )
         except HHRemoteError as exc:
             if (
@@ -549,29 +677,60 @@ class HHApplicationService:
                     ),
                     submitted_through_bot=False,
                 )
-            code, message = _application_error_details(exc)
+            code, message, can_retry, can_mark_applied = _application_error_details(exc)
+            result_url = exc.fallback_url or manual_url
+            if can_retry:
+                return await self._failed_result(
+                    application.id,
+                    code=code,
+                    message=(f"{message} Письмо и выбранное резюме сохранены."),
+                    manual_url=result_url,
+                    can_retry=True,
+                    can_mark_applied=can_mark_applied,
+                )
             return await self._manual_result(
                 application.id,
                 code=code,
-                message=message,
-                manual_url=exc.fallback_url or manual_url,
+                message=f"{message} Подготовленное письмо сохранено.",
+                manual_url=result_url,
+                can_mark_applied=can_mark_applied,
             )
-        except HHTransportError:
+        except HHTransportError as exc:
+            if _transport_failure_is_safe_to_retry(exc):
+                return await self._failed_result(
+                    application.id,
+                    code="hh_connection_failed",
+                    message=(
+                        "Не удалось соединиться с HeadHunter. Запрос не был "
+                        "отправлен; письмо и выбранное резюме сохранены."
+                    ),
+                    manual_url=manual_url,
+                    can_retry=True,
+                    can_mark_applied=True,
+                )
             return await self._manual_result(
                 application.id,
                 code="submission_result_unknown",
                 message=(
-                    "Соединение оборвалось во время отправки. Проверьте отклики на "
-                    "HeadHunter перед повторной попыткой."
+                    "Соединение оборвалось во время отправки, поэтому результат "
+                    "неизвестен. Письмо сохранено. Сначала проверьте отклики на "
+                    "HeadHunter — автоматический повтор скрыт, чтобы не создать дубль."
                 ),
                 manual_url=manual_url,
+                can_mark_applied=True,
+                result_uncertain=True,
             )
         except HHAPIError:
             return await self._manual_result(
                 application.id,
                 code="hh_request_failed",
-                message="Не удалось подтвердить отправку. Проверьте отклики на HeadHunter.",
+                message=(
+                    "Не удалось подтвердить результат отправки. Письмо сохранено. "
+                    "Проверьте отклики на HeadHunter перед новой попыткой."
+                ),
                 manual_url=manual_url,
+                can_mark_applied=True,
+                result_uncertain=True,
             )
 
         logger.info(

@@ -108,7 +108,7 @@ async def test_cover_letter_uses_provider_neutral_client_and_vacancy_context() -
 
     letter = await service.generate(vacancy)  # type: ignore[arg-type]
 
-    assert letter == "  Готовое персональное письмо.  "
+    assert letter == "Готовое персональное письмо."
     assert "Язык: русский" in provider.prompt
     assert "Junior iOS-разработчик" in provider.prompt
     assert "Резюме кандидата" in provider.prompt

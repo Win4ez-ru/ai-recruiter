@@ -43,10 +43,12 @@ flowchart LR
 2. Детали новых и устаревших вакансий обновляются с ограниченной конкурентностью.
 3. Дешёвый фильтр исключает нерелевантные и заведомо блокирующие позиции.
 4. AI получает только кандидатов после фильтра и возвращает строгую `VacancyAnalysisResult`.
-5. Pydantic повторно проверяет диапазоны, enum, массивы и запрет лишних полей.
-6. В анализе сохраняются provider, model, prompt version и SHA-256 входных данных.
-7. Изменение вакансии, профиля, резюме, модели или промпта делает оценку устаревшей и запускает переанализ.
-8. `MAX_AI_ANALYSES_PER_SEARCH` ограничивает стоимость и длительность одного запуска.
+5. YandexGPT/OpenAI обрабатывают ограниченное число вакансий параллельно; Ollama остаётся последовательной, чтобы не перегружать локальную память.
+6. Pydantic повторно проверяет диапазоны, enum, массивы и запрет лишних полей. Malformed-ответ одной вакансии пропускается, provider-level сбой останавливает запуск новых задач.
+7. В анализе сохраняются provider, model, prompt version и SHA-256 входных данных.
+8. Изменение вакансии, профиля, резюме, модели или промпта делает оценку устаревшей и запускает переанализ.
+9. Выдача фильтруется по текущим provider/model/prompt, сортируется по score и дате и ограничивается Top-5. Legacy-оценки остаются в БД, но не смешиваются с актуальными.
+10. `MAX_AI_ANALYSES_PER_SEARCH` ограничивает стоимость одного запуска, а progress обновляется в одном Telegram-сообщении.
 
 ## AI-провайдеры
 
@@ -64,13 +66,34 @@ flowchart LR
 
 - Один внешний HH-отклик имеет уникальную identity: пользователь + вакансия + резюме.
 - Первое подтверждение создаёт хешированный одноразовый token; только второе получает submission lease.
+- Черновик содержит письмо и выбранное резюме и не удаляется при внешней ошибке.
+- `429`, `5xx` и connect failure переводят черновик в recoverable `failed`; повтор создаёт новый одноразовый token.
 - Неоднозначный timeout внешнего POST не повторяется автоматически.
 - Успешный HH-результат, lifecycle вакансии и запись истории фиксируются одной локальной транзакцией.
-- При старте `submitted` без lifecycle автоматически восстанавливаются; старые `submitting` переводятся в `submission_result_unknown`.
+- При старте и периодически `submitted` без lifecycle автоматически восстанавливаются; старые `submitting` переводятся в `submission_result_unknown`, поэтому crash сразу после lease не оставляет запись зависшей навсегда.
 - Только реально отрисованная карточка получает `is_sent=true`; загрузка подборки не уничтожает непросмотренные элементы.
 - Долгая AI-операция имеет generation token и не может перерисовать экран после Back или нового действия.
 - Активный экран, collection kind, позиция и pending OAuth intent переживают рестарт.
 - Telegram failover повторяет только безопасные методы; потенциально дублирующие отправки вслепую не повторяются.
+
+## State machine отправки в HH
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft: письмо + резюме сохранены
+    draft --> awaiting_confirmation: первое подтверждение
+    awaiting_confirmation --> submitting: одноразовый lease
+    submitting --> submitted: HH вернул 201 / already_applied
+    submitting --> failed: 429 / 5xx / connect failure
+    failed --> awaiting_confirmation: безопасный retry
+    submitting --> manual_action_required: тест / внешняя форма / denied
+    submitting --> manual_action_required: результат POST неизвестен
+    manual_action_required --> applied_manual: пользователь проверил HH и подтвердил
+    failed --> draft: редактирование письма
+    manual_action_required --> draft: редактирование / повторная подготовка
+```
+
+`submission_result_unknown` принципиально не имеет автоматического перехода обратно в `submitting`: сначала пользователь проверяет официальный список откликов. Успех HH не считается подтверждённым до `201 Created` или однозначного `already_applied`.
 
 ## Lifecycle вакансии
 
@@ -120,7 +143,8 @@ stateDiagram-v2
 
 - JSON logs редактируют credentials и структурированные sensitive fields.
 - `/health/live` отражает жизнь event loop; `/health/ready` становится `200` только после БД и Telegram bootstrap.
-- CI: Python 3.11–3.13, Linux/macOS/Windows, Ruff, format check, 142 теста, coverage gate 65%, pip-audit, SQLite/PostgreSQL migrations и Docker build.
+- Search logs содержат отдельные `hh_duration_ms`, `ai_duration_ms`, число AI-запросов, cache hits и фактический concurrency; каждый ranking имеет собственную длительность.
+- CI: Python 3.11–3.13, Linux/macOS/Windows, Ruff, format check, coverage gate 65%, pip-audit, SQLite/PostgreSQL migrations и Docker build.
 
 ## Осознанные ограничения
 

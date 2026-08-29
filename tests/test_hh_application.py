@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -53,6 +54,7 @@ class FakeHHClient:
         self.resume_list_error: Exception | None = None
         self.application_error: Exception | None = None
         self.application_calls = 0
+        self.application_messages: list[str] = []
         self.vacancy_details: dict = {"apply_alternate_url": "https://hh.ru/vacancy/1"}
 
     async def get_my_resumes(self, token: str) -> list[HHResumeData]:
@@ -72,6 +74,7 @@ class FakeHHClient:
         message: str,
     ) -> str | None:
         self.application_calls += 1
+        self.application_messages.append(message)
         if self.application_error is not None:
             raise self.application_error
         return "negotiation-1"
@@ -104,7 +107,6 @@ async def make_service(
     )
     integration_repository = HHIntegrationRepository(database)
     application_repository = HHApplicationRepository(database)
-    status_repository = ApplicationRepository(database)
     client = FakeHHClient(
         resumes
         or [
@@ -120,7 +122,6 @@ async def make_service(
         oauth_service=FakeOAuth(oauth_token),  # type: ignore[arg-type]
         integration_repository=integration_repository,
         application_repository=application_repository,
-        status_repository=status_repository,
         vacancy_repository=vacancy_repository,
         cover_letter_service=FakeCoverLetter(),  # type: ignore[arg-type]
         confirmation_ttl_seconds=900,
@@ -403,13 +404,14 @@ async def test_successful_submission_overrides_concurrent_hidden_status(
     confirmation = await service.create_confirmation(
         user_id=42, application_id=preview.draft_id
     )
-    await service.status_repository.hide(vacancy_id)
+    status_repository = ApplicationRepository(database)
+    await status_repository.hide(vacancy_id)
 
     result = await service.submit_application(
         user_id=42,
         confirmation_token=confirmation.token,
     )
-    lifecycle = await service.status_repository.get(vacancy_id)
+    lifecycle = await status_repository.get(vacancy_id)
 
     assert result.status == "submitted"
     assert result.vacancy_id == vacancy_id
@@ -428,7 +430,7 @@ async def test_startup_reconciles_legacy_submitted_row(
     repaired, recovered = await repository.reconcile_incomplete_finalizations(
         stale_before=utc_now() - timedelta(minutes=5)
     )
-    lifecycle = await service.status_repository.get(vacancy_id)
+    lifecycle = await ApplicationRepository(database).get(vacancy_id)
 
     assert (repaired, recovered) == (1, 0)
     assert lifecycle is not None and lifecycle.status == "applied_bot"
@@ -465,7 +467,7 @@ async def test_registered_manual_application_blocks_stale_bot_action(
     database: Database,
 ) -> None:
     service, vacancy_id, _ = await make_service(database)
-    await service.status_repository.mark_applied_manual(vacancy_id)
+    await ApplicationRepository(database).mark_applied_manual(vacancy_id)
 
     with pytest.raises(HHAlreadyAppliedError):
         await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
@@ -488,7 +490,7 @@ async def test_already_applied_is_treated_as_submitted(database: Database) -> No
         user_id=42, confirmation_token=confirmation.token
     )
     row = await repository.get_owned(preview.draft_id, 42)
-    lifecycle = await service.status_repository.get(vacancy_id)
+    lifecycle = await ApplicationRepository(database).get(vacancy_id)
 
     assert result.status == "submitted"
     assert "уже существует" in result.message
@@ -519,20 +521,47 @@ async def test_required_test_uses_manual_action_message(database: Database) -> N
     assert "пройти тест" in result.message
     assert row is not None and row.error_code == "test_required"
 
+    repeated = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    assert repeated.status == "manual_action_required"
+    assert repeated.can_retry is False
+    assert repeated.can_mark_applied is True
+    assert repeated.manual_url == "https://hh.ru/vacancy/1"
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "expected_code"),
+    ("error", "expected_code", "expected_status", "can_retry"),
     [
-        (HHRemoteError(403, "negotiations", "resume_not_found"), "resume_not_found"),
-        (HHRemoteError(429, "rate_limit"), "rate_limit"),
-        (HHRemoteError(503, "service_unavailable"), "temporary_hh_error"),
-        (HHTransportError("unknown result"), "submission_result_unknown"),
-        (HHAPIError("timeout"), "hh_request_failed"),
+        (
+            HHRemoteError(403, "negotiations", "resume_not_found"),
+            "resume_not_found",
+            "manual_action_required",
+            False,
+        ),
+        (HHRemoteError(429, "rate_limit"), "rate_limit", "failed", True),
+        (
+            HHRemoteError(503, "service_unavailable"),
+            "temporary_hh_error",
+            "failed",
+            True,
+        ),
+        (
+            HHTransportError("unknown result"),
+            "submission_result_unknown",
+            "manual_action_required",
+            False,
+        ),
+        (HHAPIError("timeout"), "hh_request_failed", "manual_action_required", False),
     ],
 )
 async def test_submission_failures_use_safe_manual_result(
-    database: Database, error: Exception, expected_code: str
+    database: Database,
+    error: Exception,
+    expected_code: str,
+    expected_status: str,
+    can_retry: bool,
 ) -> None:
     service, vacancy_id, repository = await make_service(database)
     preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
@@ -546,7 +575,158 @@ async def test_submission_failures_use_safe_manual_result(
     )
     row = await repository.get_owned(preview.draft_id, 42)
 
-    assert result.status == "manual_action_required"
+    assert result.status == expected_status
+    assert result.application_id == preview.draft_id
+    assert result.can_retry is can_retry
     assert result.manual_url == "https://hh.ru/vacancy/1"
     assert row is not None and row.error_code == expected_code
-    assert row.api_status == "manual_action_required"
+    assert row.api_status == expected_status
+    assert row.cover_letter == preview.cover_letter
+    assert row.resume_external_id == preview.resume.external_id
+
+
+@pytest.mark.asyncio
+async def test_retry_reuses_edited_cover_letter_and_selected_resume(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    edited_letter = "Отредактированное письмо, которое нельзя потерять."
+    updated = await service.update_cover_letter(
+        user_id=42,
+        application_id=preview.draft_id,
+        cover_letter=edited_letter,
+    )
+    assert updated is not None
+    service.hh_client.application_error = HHRemoteError(  # type: ignore[attr-defined]
+        503, "service_unavailable"
+    )
+
+    first_confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    failed = await service.submit_application(
+        user_id=42, confirmation_token=first_confirmation.token
+    )
+    saved_after_failure = await repository.get_owned(preview.draft_id, 42)
+
+    assert failed.status == "failed"
+    assert failed.can_retry is True
+    assert saved_after_failure is not None
+    assert saved_after_failure.cover_letter == edited_letter
+    assert saved_after_failure.resume_external_id == "resume-1"
+
+    service.hh_client.application_error = None  # type: ignore[attr-defined]
+    retry_confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    submitted = await service.submit_application(
+        user_id=42, confirmation_token=retry_confirmation.token
+    )
+    client = service.hh_client
+
+    assert submitted.status == "submitted"
+    assert client.application_messages == [  # type: ignore[attr-defined]
+        edited_letter,
+        edited_letter,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oauth_recovery_preserves_draft_before_success(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    oauth = service.oauth_service
+    oauth.token = None  # type: ignore[attr-defined]
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+
+    unauthorized = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    preserved = await repository.get_owned(preview.draft_id, 42)
+
+    assert unauthorized.status == "failed"
+    assert unauthorized.requires_oauth is True
+    assert unauthorized.can_retry is False
+    assert preserved is not None
+    assert preserved.cover_letter == preview.cover_letter
+    assert preserved.resume_external_id == preview.resume.external_id
+
+    repeated = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    assert repeated.requires_oauth is True
+    assert repeated.can_retry is False
+    assert repeated.can_mark_applied is True
+
+    oauth.token = "fresh-token"  # type: ignore[attr-defined]
+    resumed = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    assert resumed.draft_id == preview.draft_id
+    assert resumed.cover_letter == preview.cover_letter
+    assert service.cover_letter_service.calls == 1  # type: ignore[attr-defined]
+    retry_confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+    submitted = await service.submit_application(
+        user_id=42, confirmation_token=retry_confirmation.token
+    )
+
+    assert submitted.status == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_unknown_submission_result_never_offers_automatic_retry(
+    database: Database,
+) -> None:
+    service, vacancy_id, _ = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    service.hh_client.application_error = HHTransportError(  # type: ignore[attr-defined]
+        "connection lost after POST"
+    )
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+
+    assert result.status == "manual_action_required"
+    assert result.result_uncertain is True
+    assert result.can_retry is False
+    assert result.can_mark_applied is True
+
+    repeated = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    assert repeated.result_uncertain is True
+    assert repeated.can_retry is False
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_is_retryable_because_post_was_not_sent(
+    database: Database,
+) -> None:
+    service, vacancy_id, repository = await make_service(database)
+    preview = await service.prepare_application(user_id=42, vacancy_id=vacancy_id)
+    transport_error = HHTransportError("could not connect")
+    transport_error.__cause__ = httpx.ConnectError("connection refused")
+    service.hh_client.application_error = transport_error  # type: ignore[attr-defined]
+    confirmation = await service.create_confirmation(
+        user_id=42, application_id=preview.draft_id
+    )
+
+    result = await service.submit_application(
+        user_id=42, confirmation_token=confirmation.token
+    )
+    preserved = await repository.get_owned(preview.draft_id, 42)
+
+    assert result.status == "failed"
+    assert result.error_code == "hh_connection_failed"
+    assert result.can_retry is True
+    assert result.result_uncertain is False
+    assert preserved is not None and preserved.cover_letter == preview.cover_letter

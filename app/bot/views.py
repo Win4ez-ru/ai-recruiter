@@ -27,6 +27,7 @@ from app.models import Vacancy
 logger = logging.getLogger(__name__)
 ScreenTarget = Message | CallbackQuery
 COLLECTION_LIMIT = 100
+TOP_RECOMMENDATIONS_LIMIT = 5
 
 SEARCH_ERROR_MESSAGES = {
     "hh_configuration": "HH не принял данные приложения. Проверьте HH_CLIENT_ID и HH_CLIENT_SECRET.",
@@ -36,7 +37,13 @@ SEARCH_ERROR_MESSAGES = {
     "ai_rate_limited": "AI временно ограничил запросы. Повторите позже.",
     "ai_unavailable": "AI сейчас недоступен. Повторите позже.",
     "ai_configuration": "AI-модель не настроена или недоступна.",
+    "ai_invalid_response": "AI не смог разобрать часть вакансий. Повторите поиск позже.",
 }
+
+
+def current_analysis_scope(context: BotContext) -> dict[str, str]:
+    search_service = getattr(context, "search_service", None)
+    return dict(getattr(search_service, "analysis_scope", {}))
 
 
 def target_chat_id(target: ScreenTarget) -> int | None:
@@ -53,7 +60,8 @@ async def show_main(
             context.settings.telegram_user_id
         ),
         context.vacancy_repository.count_new_candidates(
-            context.settings.min_score_to_send
+            context.settings.min_score_to_send,
+            **current_analysis_scope(context),
         ),
     )
     await context.ui.render(
@@ -119,12 +127,14 @@ async def collection_for_kind(context: BotContext, kind: str) -> list[Vacancy]:
             context.settings.min_score_to_send,
             COLLECTION_LIMIT,
             only_unsent=True,
+            **current_analysis_scope(context),
         )
     if kind == "top":
         return await context.vacancy_repository.list_digest_candidates(
             context.settings.min_score_to_send,
-            COLLECTION_LIMIT,
+            TOP_RECOMMENDATIONS_LIMIT,
             only_unsent=False,
+            **current_analysis_scope(context),
         )
     if kind in {"saved", "applied"}:
         if kind == "applied":
@@ -142,7 +152,7 @@ async def show_collection_kind(
 ) -> None:
     titles = {
         "new": "Новые вакансии",
-        "top": "Лучшие совпадения",
+        "top": "Топ-5 совпадений",
         "saved": "Избранное",
         "applied": "Мои отклики",
     }
@@ -287,16 +297,18 @@ async def run_search(context: BotContext, target: ScreenTarget) -> None:
             return
         fresh_vacancies = await context.vacancy_repository.list_digest_candidates(
             context.settings.min_score_to_send,
-            COLLECTION_LIMIT,
+            TOP_RECOMMENDATIONS_LIMIT,
             only_unsent=True,
+            **current_analysis_scope(context),
         )
         vacancies = fresh_vacancies
         cached = False
         if not vacancies:
             vacancies = await context.vacancy_repository.list_digest_candidates(
                 context.settings.min_score_to_send,
-                COLLECTION_LIMIT,
+                TOP_RECOMMENDATIONS_LIMIT,
                 only_unsent=False,
+                **current_analysis_scope(context),
             )
             cached = bool(vacancies)
         if vacancies:
@@ -307,7 +319,7 @@ async def run_search(context: BotContext, target: ScreenTarget) -> None:
                 context,
                 target,
                 vacancies,
-                title=f"Результаты поиска{suffix}",
+                title=f"Топ-{len(vacancies)} результатов{suffix}",
                 empty_message="Подходящих вакансий не найдено.",
                 kind="top" if cached else "new",
             )

@@ -216,7 +216,14 @@ class VacancyRepository:
             await session.commit()
 
     async def list_digest_candidates(
-        self, min_score: int, limit: int, *, only_unsent: bool = True
+        self,
+        min_score: int,
+        limit: int,
+        *,
+        only_unsent: bool = True,
+        provider: str | None = None,
+        model_name: str | None = None,
+        prompt_version: str | None = None,
     ) -> list[Vacancy]:
         query = (
             select(Vacancy)
@@ -227,15 +234,32 @@ class VacancyRepository:
                 VacancyAnalysis.match_score >= min_score,
                 self._recommendable_status_clause(),
             )
-            .order_by(VacancyAnalysis.match_score.desc(), Vacancy.published_at.desc())
+            .order_by(
+                VacancyAnalysis.match_score.desc(),
+                Vacancy.published_at.desc(),
+                Vacancy.id.desc(),
+            )
             .limit(limit)
         )
         if only_unsent:
             query = query.where(Vacancy.is_sent.is_(False))
+        if provider is not None:
+            query = query.where(VacancyAnalysis.provider == provider)
+        if model_name is not None:
+            query = query.where(VacancyAnalysis.model_name == model_name)
+        if prompt_version is not None:
+            query = query.where(VacancyAnalysis.prompt_version == prompt_version)
         async with self.database.session_factory() as session:
             return list((await session.scalars(query)).all())
 
-    async def count_new_candidates(self, min_score: int) -> int:
+    async def count_new_candidates(
+        self,
+        min_score: int,
+        *,
+        provider: str | None = None,
+        model_name: str | None = None,
+        prompt_version: str | None = None,
+    ) -> int:
         query = (
             select(func.count(Vacancy.id))
             .join(VacancyAnalysis)
@@ -246,6 +270,12 @@ class VacancyRepository:
                 self._recommendable_status_clause(),
             )
         )
+        if provider is not None:
+            query = query.where(VacancyAnalysis.provider == provider)
+        if model_name is not None:
+            query = query.where(VacancyAnalysis.model_name == model_name)
+        if prompt_version is not None:
+            query = query.where(VacancyAnalysis.prompt_version == prompt_version)
         async with self.database.session_factory() as session:
             return int(await session.scalar(query) or 0)
 

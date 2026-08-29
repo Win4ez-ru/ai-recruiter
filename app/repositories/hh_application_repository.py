@@ -135,6 +135,9 @@ class HHApplicationRepository:
                 return None
             row.cover_letter = cover_letter
             row.process_status = "draft"
+            row.api_status = "draft"
+            row.error_code = None
+            row.error_message = None
             await session.commit()
             await session.refresh(row)
             return row
@@ -190,14 +193,18 @@ class HHApplicationRepository:
                 application = await session.get(
                     HHApplication, confirmation.application_id
                 )
-                outcome = (
-                    "submitted"
-                    if application and application.api_status == "submitted"
-                    else "used"
-                )
+                outcome = "used"
+                if application is not None:
+                    if application.api_status == "submitted":
+                        outcome = "submitted"
+                    elif application.api_status == "submitting":
+                        outcome = "submitting"
                 return SubmissionLease(outcome, application)
             if _aware(confirmation.expires_at) <= now:
-                return SubmissionLease("expired")
+                application = await session.get(
+                    HHApplication, confirmation.application_id
+                )
+                return SubmissionLease("expired", application)
 
             consumed = await session.execute(
                 update(ApplicationConfirmation)
@@ -238,6 +245,23 @@ class HHApplicationRepository:
                 raise LookupError("Application draft not found")
             row.process_status = "manual_action_required"
             row.api_status = "manual_action_required"
+            row.error_code = code
+            row.error_message = message
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def mark_failed(
+        self, application_id: int, *, code: str, message: str
+    ) -> HHApplication:
+        """Return a recoverable submission to a retryable persisted state."""
+
+        async with self.database.session_factory() as session:
+            row = await session.get(HHApplication, application_id)
+            if row is None:
+                raise LookupError("Application draft not found")
+            row.process_status = "failed"
+            row.api_status = "failed"
             row.error_code = code
             row.error_message = message
             await session.commit()

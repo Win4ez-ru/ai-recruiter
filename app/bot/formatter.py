@@ -5,10 +5,19 @@ from html import escape
 from app.models import Vacancy
 
 DECISION_LABELS = {
-    "strong_apply": "обязательно откликнуться",
+    "strong_apply": "откликнуться в первую очередь",
     "apply": "стоит откликнуться",
-    "maybe": "можно рассмотреть",
+    "maybe": "сначала проверить условия",
     "skip": "лучше пропустить",
+}
+ROLE_LEVEL_LABELS = {
+    "intern": "Стажёр",
+    "junior": "Junior",
+    "junior_plus": "Junior+",
+    "middle": "Middle",
+    "senior": "Senior",
+    "lead": "Lead",
+    "unknown": "Не определён",
 }
 CURRENCY_SYMBOLS = {"RUR": "₽", "RUB": "₽", "USD": "$", "EUR": "€"}
 STATUS_LABELS = {
@@ -58,10 +67,16 @@ def format_salary(vacancy: Vacancy) -> str:
     return f"{value} {symbol}{tax}".strip()
 
 
-def _list_section(title: str, values: list[str], *, max_items: int = 6) -> str:
+def _list_section(
+    title: str,
+    values: list[str],
+    *,
+    max_items: int = 6,
+    item_limit: int = 220,
+) -> str:
     if not values:
         return ""
-    items = "\n".join(f"• {_safe(item, 220)}" for item in values[:max_items])
+    items = "\n".join(f"• {_safe(item, item_limit)}" for item in values[:max_items])
     return f"<b>{title}:</b>\n{items}"
 
 
@@ -122,7 +137,12 @@ def format_vacancy_card(
     score = (
         f"<b>✨ Совпадение — {analysis.match_score}%</b>\n"
         f"<code>{_score_bar(analysis.match_score)}</code>\n"
+        "🎯 <b>Рекомендация:</b> "
         f"{_safe(DECISION_LABELS.get(analysis.decision, analysis.decision), 180)}"
+    )
+    gaps = analysis.blocking_requirements or analysis.missing_skills
+    gap_title = (
+        "🚧 Критичные препятствия" if analysis.blocking_requirements else "📚 Пробелы"
     )
     blocks = [
         header,
@@ -130,15 +150,16 @@ def format_vacancy_card(
         status_line or "",
         facts,
         score,
-        f"<b>Коротко</b>\n{_summary(vacancy, 620 if not expanded else 1_350)}",
-        f"<b>🤖 Мнение AI</b>\n{_safe(analysis.reason, 720)}",
+        f"<b>🤖 Почему подходит</b>\n{_safe(analysis.reason, 520)}",
     ]
     if expanded:
         blocks.extend(
             [
+                f"<b>Описание вакансии</b>\n{_summary(vacancy, 1_100)}",
                 (
                     "<b>Детали вакансии:</b>\n"
-                    f"• Уровень: {_safe(analysis.role_level, 80)}\n"
+                    "• Уровень: "
+                    f"{_safe(ROLE_LEVEL_LABELS.get(analysis.role_level, analysis.role_level), 80)}\n"
                     f"• Занятость: {_safe(vacancy.employment, 160)}\n"
                     f"• Опубликована: {_safe(_published(vacancy), 40)}"
                 ),
@@ -153,7 +174,35 @@ def format_vacancy_card(
                 ),
                 _list_section("💪 Преимущества", analysis.advantages, max_items=5),
                 _list_section("⚠️ Риски", analysis.risks, max_items=5),
-                _list_section("🎯 Акцент в резюме", analysis.resume_focus, max_items=5),
+                _list_section(
+                    "✉️ Что подчеркнуть в письме",
+                    analysis.resume_focus,
+                    max_items=5,
+                ),
+            ]
+        )
+    else:
+        blocks.extend(
+            [
+                _list_section(
+                    "✅ Сильные совпадения",
+                    analysis.matched_skills,
+                    max_items=3,
+                    item_limit=160,
+                ),
+                _list_section(gap_title, gaps, max_items=2, item_limit=180),
+                _list_section(
+                    "⚠️ Red flags",
+                    analysis.risks,
+                    max_items=2,
+                    item_limit=180,
+                ),
+                _list_section(
+                    "✉️ Что подчеркнуть в письме",
+                    analysis.resume_focus,
+                    max_items=2,
+                    item_limit=180,
+                ),
             ]
         )
     selected: list[str] = []

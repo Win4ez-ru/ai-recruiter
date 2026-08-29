@@ -5,14 +5,20 @@ import pytest
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import EditMessageText
 
-from app.bot.hh_callback_data import ScreenCallback
+from app.bot.hh_callback_data import (
+    DraftApplicationCallback,
+    HHOAuthCallback,
+    ScreenCallback,
+)
 from app.bot.keyboards import (
+    application_result_keyboard,
     collection_keyboard,
     lifecycle_keyboard,
     main_menu_keyboard,
     manual_application_confirmation_keyboard,
 )
 from app.bot.ui import UIManager
+from app.bot.views import collection_for_kind
 from app.services.digest import DigestService
 
 
@@ -99,7 +105,7 @@ def test_applied_card_replaces_application_actions_with_status() -> None:
 
     assert "📌 Изменить статус" in labels
     assert "✅ Я уже откликнулся" not in labels
-    assert "✍️ Через бота" not in labels
+    assert "✍️ Подготовить отклик" not in labels
 
 
 def test_archived_lifecycle_offers_restore_action() -> None:
@@ -123,7 +129,7 @@ def test_terminal_card_never_offers_invalid_application_actions(status: str) -> 
 
     assert "📌 Изменить статус" in labels
     assert "❤️ В избранное" not in labels
-    assert "✍️ Через бота" not in labels
+    assert "✍️ Подготовить отклик" not in labels
     assert "🙈 Скрыть" not in labels
 
 
@@ -131,7 +137,7 @@ def test_manual_application_confirmation_is_compact_and_explicit() -> None:
     keyboard = manual_application_confirmation_keyboard(123456)
     labels = [button.text for row in keyboard.inline_keyboard for button in row]
 
-    assert labels == ["✅ Да", "❌ Отмена"]
+    assert labels == ["✅ Да, отметить", "⬅️ Не отмечать"]
     assert all(
         button.callback_data is not None
         and len(button.callback_data.encode("utf-8")) <= 64
@@ -159,6 +165,74 @@ def test_main_menu_exposes_core_sections_without_command_lists() -> None:
         "profile",
         "hh",
     } <= actions
+
+
+@pytest.mark.asyncio
+async def test_top_collection_has_an_explicit_five_item_product_limit() -> None:
+    repository = SimpleNamespace(
+        list_digest_candidates=AsyncMock(return_value=[]),
+    )
+    callback_context = SimpleNamespace(
+        settings=SimpleNamespace(min_score_to_send=65),
+        vacancy_repository=repository,
+    )
+
+    await collection_for_kind(callback_context, "top")  # type: ignore[arg-type]
+
+    repository.list_digest_candidates.assert_awaited_once_with(
+        65,
+        5,
+        only_unsent=False,
+    )
+
+
+def test_retryable_application_error_offers_only_safe_recovery_actions() -> None:
+    keyboard = application_result_keyboard(
+        "https://hh.ru/vacancy/123",
+        application_id=7,
+        vacancy_id=123,
+        can_retry=True,
+        can_mark_applied=True,
+    )
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+
+    assert "🔄 Повторить отправку" in labels
+    assert "🌐 Открыть вакансию на HH" in labels
+    assert "✅ Я откликнулся на HH" in labels
+    assert any(
+        value is not None and DraftApplicationCallback.unpack(value).action == "retry"
+        for value in callbacks
+        if value is not None and value.startswith("hhd:")
+    )
+
+
+def test_oauth_error_offers_reconnect_without_automatic_retry() -> None:
+    keyboard = application_result_keyboard(
+        application_id=7,
+        vacancy_id=123,
+        requires_oauth=True,
+    )
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+
+    assert "🔐 Переподключить HeadHunter" in labels
+    assert "🔄 Повторить отправку" not in labels
+    assert any(
+        value is not None and HHOAuthCallback.unpack(value).action == "connect"
+        for value in callbacks
+        if value is not None and value.startswith("hho:")
+    )
 
 
 @pytest.mark.asyncio

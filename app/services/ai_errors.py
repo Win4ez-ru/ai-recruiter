@@ -32,6 +32,13 @@ class AIConfigurationError(AIServiceError):
     user_message = "AI-провайдер или выбранная модель не настроены."
 
 
+class AIResponseValidationError(AIServiceError):
+    """One model response was malformed; other vacancies may still succeed."""
+
+    code: ClassVar[SearchErrorCode] = "ai_invalid_response"
+    user_message = "AI-модель вернула некорректный ответ для части вакансий."
+
+
 def normalize_openai_error(exc: BaseException) -> AIServiceError:
     if isinstance(exc, RateLimitError):
         return AIRateLimitError()

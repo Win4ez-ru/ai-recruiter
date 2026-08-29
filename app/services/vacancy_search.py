@@ -4,11 +4,12 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from time import monotonic
 
 from app.models import Vacancy, utc_now
 from app.repositories.vacancy_repository import VacancyRepository
 from app.schemas import SearchSummary, VacancyFilterResult
-from app.services.ai_errors import AIServiceError
+from app.services.ai_errors import AIResponseValidationError, AIServiceError
 from app.services.vacancy_filter import VacancyFilter
 from app.services.vacancy_ranker import VacancyRanker
 from app.sources.hh import (
@@ -45,6 +46,7 @@ class VacancySearchService:
         min_score: int,
         refresh_ttl_hours: int = 24,
         max_analyses_per_search: int = 25,
+        ranking_concurrency: int = 1,
         search_queries: list[str] | None = None,
     ) -> None:
         self.hh_client = hh_client
@@ -54,10 +56,22 @@ class VacancySearchService:
         self.min_score = min_score
         self.refresh_ttl_hours = refresh_ttl_hours
         self.max_analyses_per_search = max_analyses_per_search
+        self.ranking_concurrency = max(1, ranking_concurrency)
         self.search_queries = list(search_queries or SEARCH_QUERIES)
+
+    @property
+    def analysis_scope(self) -> dict[str, str]:
+        """Metadata that identifies analyses safe to expose as current results."""
+
+        return {
+            "provider": self.ranker.provider_name,
+            "model_name": self.ranker.model_name,
+            "prompt_version": self.ranker.prompt_version,
+        }
 
     async def run(self, progress: ProgressCallback | None = None) -> SearchSummary:
         summary = SearchSummary()
+        hh_started_at = monotonic()
         unique_items: dict[str, dict] = {}
         for query_index, query in enumerate(self.search_queries, start=1):
             if progress:
@@ -128,6 +142,7 @@ class VacancySearchService:
                 f"{summary.after_deduplication}."
             )
         if not unique_items:
+            summary.hh_duration_seconds = monotonic() - hh_started_at
             return summary
 
         refresh_ids = await self.repository.external_ids_needing_refresh(
@@ -161,6 +176,7 @@ class VacancySearchService:
         current_vacancies = await self.repository.list_by_external_ids(
             list(unique_items)
         )
+        summary.hh_duration_seconds = monotonic() - hh_started_at
         relevant_count = 0
         relevant: list[tuple[Vacancy, VacancyFilterResult]] = []
         for vacancy in current_vacancies:
@@ -177,52 +193,108 @@ class VacancySearchService:
                 )
         summary.after_prefilter = relevant_count
         relevant.sort(key=lambda item: item[0].id, reverse=True)
+        summary.cached_analyses = relevant_count - len(relevant)
         relevant = relevant[: self.max_analyses_per_search]
         if progress:
             await progress(
                 f"Подходят после фильтрации: {summary.after_prefilter}. "
+                f"Из кэша: {summary.cached_analyses}. "
                 f"Требуют AI-анализа: {len(relevant)}."
             )
 
-        for index, (vacancy, filter_result) in enumerate(relevant, start=1):
-            if progress:
-                await progress(f"AI-анализ: {index} из {len(relevant)}.")
-            try:
-                analysis = await self.ranker.rank(vacancy, filter_result)
-                if analysis is None:
+        ai_started_at = monotonic()
+        next_index = 0
+        completed = 0
+        state_lock = asyncio.Lock()
+        progress_lock = asyncio.Lock()
+        stop_analysis = asyncio.Event()
+
+        async def next_candidate() -> tuple[Vacancy, VacancyFilterResult] | None:
+            nonlocal next_index
+            async with state_lock:
+                if stop_analysis.is_set() or next_index >= len(relevant):
+                    return None
+                candidate = relevant[next_index]
+                next_index += 1
+                return candidate
+
+        async def report_completion() -> None:
+            nonlocal completed
+            async with progress_lock:
+                async with state_lock:
+                    completed += 1
+                    current = completed
+                if progress:
+                    await progress(
+                        f"🤖 Анализирую лучшие варианты… {current}/{len(relevant)}"
+                    )
+
+        async def analyze_candidates() -> None:
+            while candidate := await next_candidate():
+                vacancy, filter_result = candidate
+                summary.ai_requests += 1
+                try:
+                    analysis = await self.ranker.rank(vacancy, filter_result)
+                    if analysis is None:
+                        summary.errors += 1
+                        continue
+                    await self.repository.save_analysis(
+                        vacancy.id,
+                        analysis,
+                        self.ranker.model_name,
+                        provider=self.ranker.provider_name,
+                        prompt_version=self.ranker.prompt_version,
+                        input_hash=self.ranker.input_hash(vacancy, filter_result),
+                    )
+                    summary.analyzed += 1
+                except AIResponseValidationError as exc:
                     summary.errors += 1
-                    continue
-                await self.repository.save_analysis(
-                    vacancy.id,
-                    analysis,
-                    self.ranker.model_name,
-                    provider=self.ranker.provider_name,
-                    prompt_version=self.ranker.prompt_version,
-                    input_hash=self.ranker.input_hash(vacancy, filter_result),
-                )
-                summary.analyzed += 1
-            except AIServiceError as exc:
-                summary.errors += 1
-                if exc.code not in summary.error_codes:
-                    summary.error_codes.append(exc.code)
-                logger.warning(
-                    "Stopping AI analysis for this search run",
-                    extra={
-                        "event": "ai_analysis_stopped",
-                        "error_code": exc.code,
-                        "vacancy_id": vacancy.id,
-                    },
-                )
-                break
-            except Exception:
-                summary.errors += 1
-                logger.exception("Failed to save analysis for vacancy %s", vacancy.id)
+                    if exc.code not in summary.error_codes:
+                        summary.error_codes.append(exc.code)
+                    logger.warning(
+                        "Skipping malformed AI analysis and continuing",
+                        extra={
+                            "event": "ai_analysis_invalid",
+                            "error_code": exc.code,
+                            "vacancy_id": vacancy.id,
+                        },
+                    )
+                except AIServiceError as exc:
+                    summary.errors += 1
+                    if exc.code not in summary.error_codes:
+                        summary.error_codes.append(exc.code)
+                    stop_analysis.set()
+                    logger.warning(
+                        "Stopping new AI analysis requests for this search run",
+                        extra={
+                            "event": "ai_analysis_stopped",
+                            "error_code": exc.code,
+                            "vacancy_id": vacancy.id,
+                        },
+                    )
+                except Exception:
+                    summary.errors += 1
+                    logger.exception(
+                        "Failed to save analysis for vacancy %s", vacancy.id
+                    )
+                finally:
+                    await report_completion()
+
+        if relevant and progress:
+            await progress(f"🤖 Анализирую лучшие варианты… 0/{len(relevant)}")
+        workers = min(self.ranking_concurrency, len(relevant))
+        if workers:
+            await asyncio.gather(*(analyze_candidates() for _ in range(workers)))
+        summary.ai_duration_seconds = monotonic() - ai_started_at
 
         refreshed = await self.repository.list_by_external_ids(list(unique_items))
         summary.suitable = sum(
             1
             for vacancy in refreshed
             if vacancy.analysis is not None
+            and self.ranker.analysis_is_current(
+                vacancy, self.vacancy_filter.evaluate(vacancy)
+            )
             and vacancy.analysis.match_score >= self.min_score
             and (
                 vacancy.application is None
@@ -239,5 +311,13 @@ class VacancySearchService:
             summary.analyzed,
             summary.suitable,
             summary.errors,
+            extra={
+                "event": "vacancy_search_completed",
+                "hh_duration_ms": round(summary.hh_duration_seconds * 1000),
+                "ai_duration_ms": round(summary.ai_duration_seconds * 1000),
+                "ai_requests": summary.ai_requests,
+                "cache_hits": summary.cached_analyses,
+                "ranking_concurrency": workers,
+            },
         )
         return summary

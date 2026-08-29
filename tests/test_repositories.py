@@ -207,6 +207,62 @@ async def test_sent_vacancy_is_not_returned_in_new_digest(database: Database) ->
 
 
 @pytest.mark.asyncio
+async def test_top_five_is_unique_and_strictly_ranked(database: Database) -> None:
+    repository = VacancyRepository(database)
+    for index, score in enumerate([71, 95, 88, 95, 65, 90, 40], start=1):
+        item, _ = await repository.create_if_new(vacancy_data(f"top-{index}"))
+        await repository.save_analysis(item.id, analysis(score), "test-model")
+
+    top = await repository.list_digest_candidates(65, 5, only_unsent=False)
+    scores = [item.analysis.match_score for item in top if item.analysis is not None]
+
+    assert len(top) == 5
+    assert len({item.id for item in top}) == 5
+    assert scores == [95, 95, 90, 88, 71]
+
+
+@pytest.mark.asyncio
+async def test_recommendations_exclude_stale_provider_and_prompt_results(
+    database: Database,
+) -> None:
+    repository = VacancyRepository(database)
+    stale, _ = await repository.create_if_new(vacancy_data("stale-openai"))
+    current, _ = await repository.create_if_new(vacancy_data("current-yandex"))
+    await repository.save_analysis(
+        stale.id,
+        analysis(99),
+        "old-model",
+        provider="openai",
+        prompt_version="v1",
+    )
+    await repository.save_analysis(
+        current.id,
+        analysis(82),
+        "gpt://folder/yandexgpt-5.1",
+        provider="yandex",
+        prompt_version="v3",
+    )
+
+    scoped = await repository.list_digest_candidates(
+        65,
+        5,
+        only_unsent=False,
+        provider="yandex",
+        model_name="gpt://folder/yandexgpt-5.1",
+        prompt_version="v3",
+    )
+    new_count = await repository.count_new_candidates(
+        65,
+        provider="yandex",
+        model_name="gpt://folder/yandexgpt-5.1",
+        prompt_version="v3",
+    )
+
+    assert [item.id for item in scoped] == [current.id]
+    assert new_count == 1
+
+
+@pytest.mark.asyncio
 async def test_active_ui_message_is_persisted_across_process_sessions(
     database: Database,
 ) -> None:

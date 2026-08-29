@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -20,7 +21,13 @@ from app.bot.hh_callback_data import (
 )
 from app.bot.keyboards import final_confirmation_keyboard, resume_keyboard
 from app.bot.screens import application_preview_text, confirmation_text
-from app.schemas import ApplicationResult, HHResumeData, PreparedApplication
+from app.bot.views import run_search
+from app.schemas import (
+    ApplicationResult,
+    HHResumeData,
+    PreparedApplication,
+    SearchSummary,
+)
 from app.services.hh_application import (
     ConfirmationPreview,
     HHConfirmationError,
@@ -201,6 +208,18 @@ class FakeUI:
         if screen is not None:
             self.current_session.screen = screen
 
+    async def render_chat(
+        self,
+        bot: object,
+        chat_id: int,
+        text: str,
+        reply_markup: object = None,
+        *,
+        screen: str | None = None,
+    ) -> None:
+        if screen is not None:
+            self.current_session.screen = screen
+
 
 def context(service: FakeApplicationService) -> SimpleNamespace:
     return SimpleNamespace(
@@ -279,6 +298,24 @@ async def test_first_confirmation_does_not_call_submit_service() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retry_uses_existing_draft_and_requires_final_confirmation() -> None:
+    service = FakeApplicationService()
+    router = build_hh_applications_router(context(service))  # type: ignore[arg-type]
+    target = handler(router, "callback_query", "draft_callback")
+    msg = message()
+
+    await target(
+        callback(msg),
+        DraftApplicationCallback(action="retry", application_id=7),
+        AsyncMock(),
+    )
+
+    assert service.submit_calls == 0
+    assert "Моё сопроводительное письмо" not in msg.captured[-1]["text"]
+    assert "Подтвердить отправку" in msg.captured[-1]["text"]
+
+
+@pytest.mark.asyncio
 async def test_final_confirmation_calls_submit_and_answers_callback() -> None:
     service = FakeApplicationService()
     router = build_hh_applications_router(context(service))  # type: ignore[arg-type]
@@ -291,6 +328,68 @@ async def test_final_confirmation_calls_submit_and_answers_callback() -> None:
     assert cb.captured_answers[0]["text"] == "Отправляю отклик…"
     assert service.submit_calls == 1
     assert "Заверши отклик" in msg.captured[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_final_callback_does_not_replace_in_flight_result() -> None:
+    service = FakeApplicationService()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_submit(**kwargs: object) -> ApplicationResult:
+        service.submit_calls += 1
+        started.set()
+        await release.wait()
+        return ApplicationResult(
+            status="submitted",
+            message="Отклик отправлен.",
+            vacancy_id=3,
+        )
+
+    service.submit_application = slow_submit  # type: ignore[method-assign]
+    router = build_hh_applications_router(context(service))  # type: ignore[arg-type]
+    target = handler(router, "callback_query", "final_confirmation_callback")
+    first = callback(message())
+    second = callback(message())
+
+    first_task = asyncio.create_task(
+        target(first, ConfirmationCallback(token="one-time-token"))
+    )
+    await started.wait()
+    await target(second, ConfirmationCallback(token="one-time-token"))
+    release.set()
+    await first_task
+
+    assert service.submit_calls == 1
+    assert second.captured_answers[0]["text"] == "Отклик уже отправляется…"
+    assert second.captured_answers[0]["show_alert"] is True
+
+
+@pytest.mark.asyncio
+async def test_oauth_failure_preserves_pending_vacancy_and_offers_reconnect() -> None:
+    service = FakeApplicationService()
+
+    async def oauth_failed(**kwargs: object) -> ApplicationResult:
+        return ApplicationResult(
+            status="failed",
+            message="Авторизация истекла, черновик сохранён.",
+            vacancy_id=3,
+            application_id=7,
+            requires_oauth=True,
+        )
+
+    service.submit_application = oauth_failed  # type: ignore[method-assign]
+    callback_context = context(service)
+    router = build_hh_applications_router(callback_context)  # type: ignore[arg-type]
+    target = handler(router, "callback_query", "final_confirmation_callback")
+    msg = message()
+
+    await target(callback(msg), ConfirmationCallback(token="one-time-token"))
+
+    assert callback_context.ui.current_session.pending_vacancy_id == 3
+    keyboard = msg.captured[-1]["reply_markup"]
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert "🔐 Переподключить HeadHunter" in labels
 
 
 @pytest.mark.asyncio
@@ -402,7 +501,7 @@ def test_manual_resume_fallback_is_disclosed_before_confirmation() -> None:
 
     assert "Автоматической отправки не будет" in confirmation_text(application)
     assert "резюме нужно будет выбрать" in application_preview_text(application)
-    assert "↗️ Показать ручной шаг" in labels
+    assert "🌐 Открыть ручной шаг" in labels
 
 
 @pytest.mark.asyncio
@@ -474,6 +573,36 @@ async def test_command_cancels_in_flight_application_operation() -> None:
     await target(message("/start"), AsyncMock())
 
     assert ui.operation_is_current(42, generation) is False
+    assert ui.current_session.screen == "menu"
+
+
+@pytest.mark.asyncio
+async def test_search_completion_cannot_overwrite_screen_opened_with_back() -> None:
+    ui = FakeUI()
+    repository = SimpleNamespace(
+        list_digest_candidates=AsyncMock(return_value=[]),
+    )
+
+    class SearchService:
+        analysis_scope: dict[str, str] = {}
+
+        async def run(self, progress) -> SearchSummary:
+            await progress("🤖 Анализирую лучшие варианты… 1/3")
+            ui.current_session.screen = "menu"
+            return SearchSummary(found=3)
+
+    search_context = SimpleNamespace(
+        settings=SimpleNamespace(min_score_to_send=65),
+        ui=ui,
+        search_lock=asyncio.Lock(),
+        search_service=SearchService(),
+        vacancy_repository=repository,
+    )
+    target_message = message().as_(SimpleNamespace())
+
+    await run_search(search_context, target_message)  # type: ignore[arg-type]
+
+    repository.list_digest_candidates.assert_not_awaited()
     assert ui.current_session.screen == "menu"
 
 

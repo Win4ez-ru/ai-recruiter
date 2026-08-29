@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from hashlib import sha256
+from time import monotonic
 
 from app.models import Vacancy
 from app.schemas import CandidateProfile, VacancyAnalysisResult, VacancyFilterResult
@@ -10,7 +11,7 @@ from app.services.ai_errors import AIServiceError
 from app.services.ai_provider import AIProvider
 
 logger = logging.getLogger(__name__)
-PROMPT_VERSION = "vacancy-ranker-2026-08-24.v2"
+PROMPT_VERSION = "vacancy-ranker-2026-08-29.v3"
 MAX_RESUME_CHARS = 20_000
 MAX_DESCRIPTION_CHARS = 12_000
 MAX_REQUIREMENTS_CHARS = 6_000
@@ -26,10 +27,16 @@ SYSTEM_PROMPT = """Ты оцениваешь соответствие вакан
 6. Не занижай оценку только из-за слова Middle: оцени фактические требования.
 7. Блокеры: обязательные 4+ года опыта, обязательное руководство, обязательная
    релокация, отсутствие iOS/Swift, только Objective-C, жесткая Senior/Lead-позиция.
-8. Причины пиши кратко и конкретно.
+8. reason: 2–3 коротких предложения — итог, главные доказательства и критичность
+   пробелов. Не повторяй score словами.
 9. Оценка: 90–100 почти идеально; 75–89 хорошо; 60–74 допустимо;
    40–59 слабо; 0–39 не откликаться.
-10. Верни только данные заданной схемы."""
+10. matched_skills: до 5 проверяемых совпадений; missing_skills: до 4
+    некритичных пробелов; blocking_requirements: только обязательные блокеры.
+11. risks: до 3 конкретных red flags вакансии или несоответствий.
+12. resume_focus: до 3 правдивых тезисов, которые стоит подчеркнуть именно в
+    сопроводительном письме. Не советуй приписывать отсутствующий опыт.
+13. Верни только данные заданной схемы."""
 
 
 class VacancyRanker:
@@ -112,13 +119,14 @@ class VacancyRanker:
         self, vacancy: Vacancy, filter_result: VacancyFilterResult
     ) -> VacancyAnalysisResult | None:
         payload = self._payload(vacancy, filter_result)
+        started_at = monotonic()
         logger.info(
             "Calling AI ranker for vacancy %s",
             vacancy.id,
             extra={"event": "ai_rank_started", "provider": self.client.name},
         )
         try:
-            return await self.client.generate_structured(
+            result = await self.client.generate_structured(
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -129,6 +137,18 @@ class VacancyRanker:
                 ],
                 response_model=VacancyAnalysisResult,
             )
+            logger.info(
+                "AI ranker completed for vacancy %s in %.2fs",
+                vacancy.id,
+                monotonic() - started_at,
+                extra={
+                    "event": "ai_rank_completed",
+                    "provider": self.client.name,
+                    "vacancy_id": vacancy.id,
+                    "duration_ms": round((monotonic() - started_at) * 1000),
+                },
+            )
+            return result
         except AIServiceError:
             logger.warning(
                 "AI analysis request failed",
@@ -136,6 +156,7 @@ class VacancyRanker:
                     "event": "ai_rank_failed",
                     "provider": self.client.name,
                     "vacancy_id": vacancy.id,
+                    "duration_ms": round((monotonic() - started_at) * 1000),
                 },
             )
             raise

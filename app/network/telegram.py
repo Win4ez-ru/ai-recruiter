@@ -85,6 +85,16 @@ class FailoverTelegramSession(BaseSession):
         self._status_callback = status_callback
         self._active_index = 0
         self._state_lock = asyncio.Lock()
+        self._closing = False
+
+    def begin_shutdown(self) -> None:
+        """Stop new route attempts before closing the underlying sessions."""
+
+        self._closing = True
+
+    def _ensure_running(self) -> None:
+        if self._closing:
+            raise asyncio.CancelledError
 
     @property
     def status(self) -> TelegramTransportStatus:
@@ -157,6 +167,7 @@ class FailoverTelegramSession(BaseSession):
         method: TelegramMethod[TelegramResult],
         timeout: int | None = None,
     ) -> TelegramResult:
+        self._ensure_running()
         method_name = method.__api_method__
         route_order = self._route_order()
         last_error: BaseException | None = None
@@ -165,6 +176,7 @@ class FailoverTelegramSession(BaseSession):
             try:
                 result = await route.session.make_request(bot, method, timeout)
             except ROUTE_ERRORS as exc:
+                self._ensure_running()
                 last_error = exc
                 await self._mark_failure(index, exc)
                 may_retry = method_name in SAFE_RETRY_METHODS
@@ -185,6 +197,7 @@ class FailoverTelegramSession(BaseSession):
         chunk_size: int = 65536,
         raise_for_status: bool = True,
     ) -> AsyncGenerator[bytes, None]:
+        self._ensure_running()
         route_order = self._route_order()
         for position, index in enumerate(route_order):
             route = self._routes[index]
@@ -200,6 +213,7 @@ class FailoverTelegramSession(BaseSession):
                     emitted = True
                     yield chunk
             except STREAM_ERRORS as exc:
+                self._ensure_running()
                 await self._mark_failure(index, exc)
                 if emitted or position == len(route_order) - 1:
                     raise
@@ -208,6 +222,7 @@ class FailoverTelegramSession(BaseSession):
             return
 
     async def close(self) -> None:
+        self.begin_shutdown()
         results = await asyncio.gather(
             *(route.session.close() for route in self._routes),
             return_exceptions=True,

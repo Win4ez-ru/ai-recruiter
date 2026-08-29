@@ -60,7 +60,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Запуск и список команд"),
     BotCommand(command="search", description="Запустить поиск"),
     BotCommand(command="new", description="Новые вакансии"),
-    BotCommand(command="top", description="Лучшие вакансии"),
+    BotCommand(command="top", description="Топ-5 вакансий"),
     BotCommand(command="saved", description="Сохраненные"),
     BotCommand(command="applied", description="Мои отклики"),
     BotCommand(command="stats", description="Статистика"),
@@ -74,12 +74,15 @@ async def async_main(settings: Settings) -> None:
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     registered_signals: list[signal.Signals] = []
+    telegram_session: FailoverTelegramSession | None = None
 
     def request_shutdown(signal_name: str) -> None:
         logger.info(
             "Shutdown signal received",
             extra={"event": "shutdown_requested", "signal": signal_name},
         )
+        if telegram_session is not None:
+            telegram_session.begin_shutdown()
         if main_task is not None and not main_task.cancelling():
             main_task.cancel()
 
@@ -117,7 +120,6 @@ async def async_main(settings: Settings) -> None:
     profile = load_candidate_profile(settings.candidate_profile_path)
     resume = load_resume(settings.resume_path)
     database: Database | None = None
-    telegram_session: FailoverTelegramSession | None = None
     ai_provider: AIProvider | None = None
     hh_client: HHClient | None = None
     scheduler = None
@@ -208,6 +210,11 @@ async def async_main(settings: Settings) -> None:
             min_score=settings.min_score_to_send,
             refresh_ttl_hours=settings.vacancy_refresh_ttl_hours,
             max_analyses_per_search=settings.max_ai_analyses_per_search,
+            ranking_concurrency=(
+                1
+                if settings.ai_provider == "ollama"
+                else settings.ai_ranking_concurrency
+            ),
             search_queries=settings.hh_search_queries,
         )
         hh_oauth_service = HHOAuthService(
@@ -218,7 +225,6 @@ async def async_main(settings: Settings) -> None:
             oauth_service=hh_oauth_service,
             integration_repository=hh_integration_repository,
             application_repository=hh_application_repository,
-            status_repository=application_repository,
             vacancy_repository=vacancy_repository,
             cover_letter_service=cover_letter_service,
             confirmation_ttl_seconds=settings.hh_confirmation_ttl_seconds,
@@ -309,12 +315,18 @@ def run() -> None:
     try:
         settings = get_settings()
     except ValidationError as exc:
-        fields = ", ".join(str(error.get("loc", ["?"])[0]) for error in exc.errors())
+        fields = ", ".join(
+            dict.fromkeys(
+                str(location[0]) if location else "общие настройки"
+                for error in exc.errors(include_input=False, include_url=False)
+                if isinstance((location := error.get("loc", ())), (tuple, list))
+            )
+        )
         print(
-            f"Ошибка конфигурации. Проверьте .env. Поля: {fields}",
+            f"Ошибка конфигурации. Проверьте .env. Поля: {fields or 'неизвестно'}",
             file=sys.stderr,
         )
-        raise SystemExit(2) from exc
+        raise SystemExit(2) from None
 
     configure_logging(
         settings.log_level,

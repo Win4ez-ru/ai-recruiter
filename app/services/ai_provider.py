@@ -11,6 +11,7 @@ from openai import AsyncOpenAI, OpenAIError
 from pydantic import BaseModel, ValidationError
 
 from app.services.ai_errors import (
+    AIResponseValidationError,
     AIServiceError,
     normalize_ollama_error,
     normalize_openai_error,
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 ChatMessage = Mapping[str, str]
 TEXT_MAX_OUTPUT_TOKENS = 1_200
-STRUCTURED_MAX_OUTPUT_TOKENS = 2_000
+STRUCTURED_MAX_OUTPUT_TOKENS = 1_200
 
 
 class AIProvider(Protocol):
@@ -76,11 +77,11 @@ class OpenAIProvider:
         except OpenAIError as exc:
             raise normalize_openai_error(exc) from exc
         if response.output_parsed is None:
-            raise AIServiceError("AI provider returned no structured output")
+            raise AIResponseValidationError("AI provider returned no structured output")
         try:
             return response_model.model_validate(response.output_parsed)
         except ValidationError as exc:
-            raise AIServiceError(
+            raise AIResponseValidationError(
                 "AI provider returned invalid structured output"
             ) from exc
 
@@ -160,7 +161,9 @@ class OllamaProvider:
         try:
             return response_model.model_validate_json(_ollama_message_content(payload))
         except (ValidationError, ValueError) as exc:
-            raise AIServiceError("Ollama returned invalid structured output") from exc
+            raise AIResponseValidationError(
+                "Ollama returned invalid structured output"
+            ) from exc
 
     async def _chat(self, body: dict[str, Any]) -> dict[str, Any]:
         for attempt in range(self._max_retries + 1):
@@ -238,12 +241,16 @@ class YandexProvider:
             raise normalize_openai_error(exc) from exc
 
         if response.choices and response.choices[0].finish_reason == "length":
-            raise AIServiceError("Yandex structured output exceeded the token limit")
+            raise AIResponseValidationError(
+                "Yandex structured output exceeded the token limit"
+            )
         content = _chat_completion_content(response)
         try:
             return response_model.model_validate_json(content)
         except (ValidationError, ValueError) as exc:
-            raise AIServiceError("Yandex returned invalid structured output") from exc
+            raise AIResponseValidationError(
+                "Yandex returned invalid structured output"
+            ) from exc
 
     async def close(self) -> None:
         await self._client.close()

@@ -50,7 +50,11 @@ def main_menu_text(
         "openai": "OpenAI",
     }.get(ai_provider, ai_provider)
     notice_block = f"💬 <i>{escape(notice)}</i>\n\n" if notice else ""
-    demo_block = "\n🧪 <b>Безопасный демо-режим включён</b>" if demo_mode else ""
+    mode_block = (
+        "\n🧪 <b>Демо-режим:</b> внешняя отправка отключена"
+        if demo_mode
+        else "\n📤 <b>Реальные отклики:</b> после двойного подтверждения"
+    )
     return (
         "<b>👋 AI Recruiter</b>\n"
         "<i>Персональный поиск вакансий</i>\n\n"
@@ -60,7 +64,7 @@ def main_menu_text(
         f"👤 <b>Профиль:</b> готов\n"
         f"🤖 <b>AI-модель:</b> {escape(ai_name)}\n"
         f"🔐 <b>HeadHunter:</b> {hh_status}\n"
-        f"✨ <b>Непросмотренных:</b> {new_count}{demo_block}\n\n"
+        f"✨ <b>Непросмотренных:</b> {new_count}{mode_block}\n\n"
         "Выберите раздел ниже."
     )
 
@@ -69,9 +73,12 @@ def help_text() -> str:
     return (
         "<b>💡 Как это работает</b>\n\n"
         "<b>1.</b> Запустите поиск — бот соберёт свежие вакансии.\n"
-        "<b>2.</b> Листайте результаты в одной карточке.\n"
-        "<b>3.</b> Сохраняйте интересное или готовьте отклик.\n"
-        "<b>4.</b> Проверьте письмо и подтвердите отправку.\n\n"
+        "<b>2.</b> Получите Top-5 с объяснением совпадений, пробелов и рисков.\n"
+        "<b>3.</b> Листайте карточки и сохраняйте интересное.\n"
+        "<b>4.</b> Проверьте резюме и персональное письмо.\n"
+        "<b>5.</b> Реальный отклик уйдёт только после второго подтверждения.\n\n"
+        "Если HH временно не ответит, черновик письма и выбранное резюме "
+        "останутся сохранены.\n\n"
         "Весь интерфейс живёт в одном сообщении. Команды остаются доступны, "
         "но удобнее пользоваться кнопками."
     )
@@ -211,14 +218,21 @@ def edit_letter_text() -> str:
     )
 
 
-def result_text(message: str, *, status: str) -> str:
+def result_text(message: str, *, status: str, result_uncertain: bool = False) -> str:
     icon, title = {
         "submitted": ("✅", "Отклик отправлен"),
         "demo": ("🧪", "Демонстрация завершена безопасно"),
         "manual_action_required": ("↗️", "Требуется действие на HeadHunter"),
-        "failed": ("⚠️", "Не удалось отправить отклик"),
+        "failed": ("⚠️", "Отправка не выполнена"),
     }.get(status, ("⚠️", "Результат отклика"))
-    return f"<b>{icon} {title}</b>\n\n{escape(message)}"
+    if result_uncertain:
+        icon, title = "🔎", "Результат нужно проверить"
+    draft_note = (
+        "\n\n📝 <b>Черновик сохранён:</b> письмо и выбранное резюме не потеряны."
+        if status in {"failed", "manual_action_required"}
+        else ""
+    )
+    return f"<b>{icon} {title}</b>\n\n{escape(message)}{draft_note}"
 
 
 def manual_application_confirmation_text(vacancy: Vacancy) -> str:

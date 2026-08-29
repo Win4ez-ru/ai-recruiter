@@ -88,6 +88,7 @@ async def _return_to_collection(
 
 def build_hh_applications_router(context: BotContext) -> Router:
     router = Router(name="hh_applications")
+    active_submissions: set[str] = set()
 
     async def is_authorized(callback: CallbackQuery) -> bool:
         if callback.from_user.id == context.settings.telegram_user_id:
@@ -300,7 +301,7 @@ def build_hh_applications_router(context: BotContext) -> Router:
         if action == "back":
             await _show_preview(context, callback, preview)
             return
-        if action != "confirm":
+        if action not in {"confirm", "retry"}:
             await context.ui.render(
                 callback,
                 _error_text("Эта кнопка устарела."),
@@ -391,44 +392,66 @@ def build_hh_applications_router(context: BotContext) -> Router:
     ) -> None:
         if not await is_authorized(callback):
             return
-        await callback.answer("Отправляю отклик…")
         if not isinstance(callback.message, Message):
+            await callback.answer()
             return
-        chat_id = callback.message.chat.id
-        operation = context.ui.start_operation(chat_id)
-        await context.ui.render(
-            callback,
-            "<b>📤 Отправляю отклик</b>\n\nЖду подтверждение от HeadHunter…",
-            None,
-            screen="confirmation",
-        )
+        if callback_data.token in active_submissions:
+            await callback.answer("Отклик уже отправляется…", show_alert=True)
+            return
+        active_submissions.add(callback_data.token)
         try:
-            result = await context.hh_application_service.submit_application(
-                user_id=callback.from_user.id,
-                confirmation_token=callback_data.token,
+            await callback.answer("Отправляю отклик…")
+            chat_id = callback.message.chat.id
+            operation = context.ui.start_operation(chat_id)
+            await context.ui.render(
+                callback,
+                "<b>📤 Отправляю отклик</b>\n\nЖду подтверждение от HeadHunter…",
+                None,
+                screen="confirmation",
             )
-        except Exception:
-            logger.exception("Unexpected final HH application error")
+            try:
+                result = await context.hh_application_service.submit_application(
+                    user_id=callback.from_user.id,
+                    confirmation_token=callback_data.token,
+                )
+            except Exception:
+                logger.exception("Unexpected final HH application error")
+                if not context.ui.operation_is_current(chat_id, operation):
+                    return
+                await context.ui.render(
+                    callback,
+                    _error_text(
+                        "Не удалось подтвердить результат. Проверьте отклики на "
+                        "HeadHunter. Сохранённый черновик останется доступен."
+                    ),
+                    application_result_keyboard(),
+                    screen="application_result",
+                )
+                return
+            if result.status == "submitted" and result.vacancy_id is not None:
+                context.ui.remove_from_collection(chat_id, result.vacancy_id)
+            if result.requires_oauth and result.vacancy_id is not None:
+                context.ui.set_pending_vacancy(chat_id, result.vacancy_id)
             if not context.ui.operation_is_current(chat_id, operation):
                 return
             await context.ui.render(
                 callback,
-                _error_text(
-                    "Не удалось подтвердить результат. Проверьте отклики на HeadHunter."
+                result_text(
+                    result.message,
+                    status=result.status,
+                    result_uncertain=result.result_uncertain,
                 ),
-                application_result_keyboard(),
+                application_result_keyboard(
+                    result.manual_url,
+                    application_id=result.application_id,
+                    vacancy_id=result.vacancy_id,
+                    can_retry=result.can_retry,
+                    can_mark_applied=result.can_mark_applied,
+                    requires_oauth=result.requires_oauth,
+                ),
                 screen="application_result",
             )
-            return
-        if result.status == "submitted" and result.vacancy_id is not None:
-            context.ui.remove_from_collection(chat_id, result.vacancy_id)
-        if not context.ui.operation_is_current(chat_id, operation):
-            return
-        await context.ui.render(
-            callback,
-            result_text(result.message, status=result.status),
-            application_result_keyboard(result.manual_url),
-            screen="application_result",
-        )
+        finally:
+            active_submissions.discard(callback_data.token)
 
     return router

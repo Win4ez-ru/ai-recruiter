@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=5, ge=1, le=100)
     database_max_overflow: int = Field(default=10, ge=0, le=200)
     database_pool_recycle_seconds: int = Field(default=1800, ge=60)
-    hh_user_agent: str = "KirillJobAgent/1.0"
+    hh_user_agent: str = "AIRecruiter/1.0"
     hh_search_queries: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: list(DEFAULT_HH_SEARCH_QUERIES)
     )
@@ -148,8 +148,9 @@ class Settings(BaseSettings):
     search_interval_hours: int = Field(default=12, ge=1)
     vacancy_refresh_ttl_hours: int = Field(default=24, ge=1, le=720)
     max_ai_analyses_per_search: int = Field(default=25, ge=1, le=200)
+    ai_ranking_concurrency: int = Field(default=3, ge=1, le=10)
     min_score_to_send: int = Field(default=65, ge=0, le=100)
-    max_vacancies_per_digest: int = Field(default=10, ge=1, le=50)
+    max_vacancies_per_digest: int = Field(default=5, ge=1, le=50)
     log_level: str = "INFO"
     log_format: Literal["json", "text"] = "json"
     log_file_enabled: bool = False
