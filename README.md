@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/Win4ez-ru/ai-recruiter/actions/workflows/ci.yml/badge.svg)](https://github.com/Win4ez-ru/ai-recruiter/actions/workflows/ci.yml)
 
-AI Recruiter is a private Telegram job-search agent that finds fresh vacancies through
-the official HeadHunter API, removes duplicates, filters weak matches before spending
-LLM tokens, produces an explainable shortlist, and tracks an application from draft to
-offer.
+AI Recruiter is a single-user Telegram job-search agent that finds fresh vacancies
+through the official HeadHunter API, removes duplicates, filters weak matches before
+spending LLM tokens, produces an explainable shortlist, and tracks an application from
+draft to offer.
 
 It is deliberately built as a modular asynchronous monolith for one operator. The
 project focuses on the engineering around real external systems: provider abstraction,
